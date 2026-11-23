@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, rm, truncate } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, rename, rm, truncate, unlink } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { JsonlFileSystem } from "./filesystem.js";
 import { JsonlSessionStore, type JsonlSessionStoreOptions } from "./store.js";
@@ -67,6 +67,30 @@ export class NodeJsonlFileSystem implements JsonlFileSystem {
 
   async truncate(path: string, byteLength: number): Promise<void> {
     await truncate(path, byteLength);
+  }
+
+  async listFiles(directory: string): Promise<string[]> {
+    try {
+      const entries = await readdir(directory, { withFileTypes: true });
+      return entries.filter((entry) => entry.isFile()).map((entry) => entry.name);
+    } catch (error) {
+      if (isEnoent(error)) {
+        return [];
+      }
+      throw error;
+    }
+  }
+
+  async remove(path: string): Promise<boolean> {
+    try {
+      await unlink(path);
+      return true;
+    } catch (error) {
+      if (isEnoent(error)) {
+        return false;
+      }
+      throw error;
+    }
   }
 }
 

@@ -1,6 +1,12 @@
 /// <reference lib="dom" />
 
-import type { SessionSnapshot, SessionStore } from "../types.js";
+import {
+  sortSessionSummaries,
+  summarizeSnapshot,
+  type SessionSnapshot,
+  type SessionStore,
+  type SessionSummary,
+} from "../types.js";
 
 const DATABASE_VERSION = 1;
 const DEFAULT_STORE_NAME = "harness_sessions";
@@ -136,6 +142,29 @@ export class IndexedDbSessionStore implements SessionStore {
     const done = transactionResult(tx);
     await requestResult(store.put(record));
     await done;
+  }
+
+  async delete(sessionId: string): Promise<boolean> {
+    this.assertOpen();
+    const tx = this.db.transaction(this.storeName, "readwrite");
+    const store = tx.objectStore(this.storeName);
+    const done = transactionResult(tx);
+    const existing = await requestResult(store.get(sessionId));
+    if (existing !== undefined) {
+      await requestResult(store.delete(sessionId));
+    }
+    await done;
+    return existing !== undefined;
+  }
+
+  async list(): Promise<SessionSummary[]> {
+    this.assertOpen();
+    const tx = this.db.transaction(this.storeName, "readonly");
+    const store = tx.objectStore(this.storeName);
+    const done = transactionResult(tx);
+    const records = (await requestResult(store.getAll())) as IndexedDbSessionRecord[];
+    await done;
+    return sortSessionSummaries(records.map((record) => summarizeSnapshot(record.snapshot)));
   }
 
   async close(): Promise<void> {

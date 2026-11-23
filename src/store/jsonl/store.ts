@@ -1,4 +1,10 @@
-import type { SessionSnapshot, SessionStore } from "../../types.js";
+import {
+  sortSessionSummaries,
+  summarizeSnapshot,
+  type SessionSnapshot,
+  type SessionStore,
+  type SessionSummary,
+} from "../../types.js";
 import { SerialOperationQueue } from "../sqlite/database.js";
 import type { JsonlFileSystem } from "./filesystem.js";
 
@@ -270,6 +276,37 @@ export class JsonlSessionStore implements SessionStore {
       this.lineCounts.set(sessionId, 1);
       return true;
     });
+  }
+
+  async delete(sessionId: string): Promise<boolean> {
+    this.assertOpen();
+    if (this.readOnly) {
+      throw new JsonlStorageReadOnlyError();
+    }
+    return this.queueFor(sessionId).runAsync(async () => {
+      this.assertOpen();
+      const filePath = this.sessionFilePath(sessionId);
+      const removed = await this.fs.remove(filePath);
+      this.lineCounts.delete(sessionId);
+      return removed;
+    });
+  }
+
+  async list(): Promise<SessionSummary[]> {
+    this.assertOpen();
+    const files = await this.fs.listFiles(this.directory);
+    const summaries: SessionSummary[] = [];
+    for (const fileName of files) {
+      if (!fileName.endsWith(".jsonl")) continue;
+      const filePath = joinPath(this.directory, fileName);
+      const content = await this.fs.readFile(filePath);
+      if (content === null) continue;
+      const parsed = parseJsonlContent(content, filePath);
+      if (parsed.latestSnapshot !== null) {
+        summaries.push(summarizeSnapshot(parsed.latestSnapshot));
+      }
+    }
+    return sortSessionSummaries(summaries);
   }
 
   async close(): Promise<void> {

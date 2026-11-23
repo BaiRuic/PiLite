@@ -15,4 +15,8 @@ export interface JsonlFileSystem {
   writeFileAtomic(path: string, content: string, options?: { readonly fsync?: boolean }): Promise<void>;
   /** Truncate an existing file to `byteLength` bytes (used to drop torn tail lines). */
   truncate(path: string, byteLength: number): Promise<void>;
+  /** List file names directly inside `directory` (returns `[]` if directory does not exist). */
+  listFiles(directory: string): Promise<string[]>;
+  /** Remove a file if it exists, returning `true` when deleted and `false` when absent. */
+  remove(path: string): Promise<boolean>;
 }

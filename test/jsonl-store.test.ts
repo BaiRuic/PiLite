@@ -58,6 +58,7 @@ describe("JsonlSessionStore (crash tolerance, compaction, and readOnly mode)", (
         expect(await reader.load("torn-session")).toEqual(snap1);
         await expect(reader.save("torn-session", snap1)).rejects.toBeInstanceOf(JsonlStorageReadOnlyError);
         await expect(reader.compact("torn-session")).rejects.toBeInstanceOf(JsonlStorageReadOnlyError);
+        await expect(reader.delete("torn-session")).rejects.toBeInstanceOf(JsonlStorageReadOnlyError);
       } finally {
         await reader.close();
       }

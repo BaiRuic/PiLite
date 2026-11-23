@@ -408,6 +408,8 @@ describe("HarnessSession", () => {
           }
           await innerStore.save(id, snapshot);
         },
+        delete: (id) => innerStore.delete(id),
+        list: () => innerStore.list(),
       };
 
       faux.setResponses([fauxAssistantMessage("should never run")]);
@@ -523,6 +525,8 @@ describe("HarnessSession", () => {
           }
           await innerStore.save(id, snapshot);
         },
+        delete: (id) => innerStore.delete(id),
+        list: () => innerStore.list(),
       };
 
       faux.setResponses([fauxAssistantMessage("never called")]);
@@ -557,6 +561,8 @@ describe("HarnessSession", () => {
           }
           await innerStore.save(id, snapshot);
         },
+        delete: (id) => innerStore.delete(id),
+        list: () => innerStore.list(),
       };
 
       faux.setResponses([

@@ -38,6 +38,8 @@ export { InMemorySessionStore } from "./store/memory.js";
 export {
   HarnessError,
   SESSION_SNAPSHOT_VERSION,
+  sortSessionSummaries,
+  summarizeSnapshot,
   type BaseSessionOptions,
   type CreateSessionOptions,
   type CustomSessionEntry,
@@ -49,5 +51,6 @@ export {
   type SessionSnapshot,
   type SessionStatus,
   type SessionStore,
+  type SessionSummary,
   type SessionTerminalStatus,
 } from "./types.js";

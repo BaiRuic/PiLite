@@ -35,16 +35,54 @@ export interface SessionSnapshot {
   readonly version: typeof SESSION_SNAPSHOT_VERSION;
   readonly sessionId: string;
   readonly model: ModelRef;
+  readonly thinkingLevel?: ThinkingLevel;
+  readonly title?: string;
+  readonly parentSessionId?: string;
   readonly messages: AgentMessage[];
   readonly customEntries?: CustomSessionEntry[];
   readonly status: SessionStatus;
   readonly lastError?: string;
+  readonly createdAt?: number;
   readonly updatedAt: number;
+}
+
+export interface SessionSummary {
+  readonly sessionId: string;
+  readonly model: ModelRef;
+  readonly status: SessionStatus;
+  readonly title?: string;
+  readonly parentSessionId?: string;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly messageCount: number;
 }
 
 export interface SessionStore {
   load(sessionId: string): Promise<SessionSnapshot | null>;
   save(sessionId: string, snapshot: SessionSnapshot): Promise<void>;
+  delete(sessionId: string): Promise<boolean>;
+  list(): Promise<SessionSummary[]>;
+}
+
+/** Build a `SessionSummary` from a full `SessionSnapshot`. */
+export function summarizeSnapshot(snapshot: SessionSnapshot): SessionSummary {
+  return {
+    sessionId: snapshot.sessionId,
+    model: { provider: snapshot.model.provider, modelId: snapshot.model.modelId },
+    status: snapshot.status,
+    ...(snapshot.title !== undefined ? { title: snapshot.title } : {}),
+    ...(snapshot.parentSessionId !== undefined ? { parentSessionId: snapshot.parentSessionId } : {}),
+    createdAt: snapshot.createdAt ?? snapshot.updatedAt,
+    updatedAt: snapshot.updatedAt,
+    messageCount: snapshot.messages.length,
+  };
+}
+
+/** Sort summaries newest-updated first, breaking ties deterministically by `sessionId`. */
+export function sortSessionSummaries(summaries: SessionSummary[]): SessionSummary[] {
+  return summaries.sort(
+    (a, b) => b.updatedAt - a.updatedAt || a.sessionId.localeCompare(b.sessionId),
+  );
 }
 
 export type SessionEventListener = (event: AgentEvent, signal: AbortSignal) => Promise<void> | void;

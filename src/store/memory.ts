@@ -1,4 +1,10 @@
-import type { SessionSnapshot, SessionStore } from "../types.js";
+import {
+  sortSessionSummaries,
+  summarizeSnapshot,
+  type SessionSnapshot,
+  type SessionStore,
+  type SessionSummary,
+} from "../types.js";
 
 /**
  * In-memory `SessionStore` for unit tests and ephemeral sessions.
@@ -14,6 +20,15 @@ export class InMemorySessionStore implements SessionStore {
 
   async save(sessionId: string, snapshot: SessionSnapshot): Promise<void> {
     this.snapshots.set(sessionId, structuredClone(snapshot));
+  }
+
+  async delete(sessionId: string): Promise<boolean> {
+    return this.snapshots.delete(sessionId);
+  }
+
+  async list(): Promise<SessionSummary[]> {
+    const summaries = [...this.snapshots.values()].map(summarizeSnapshot);
+    return sortSessionSummaries(summaries);
   }
 
   has(sessionId: string): boolean {

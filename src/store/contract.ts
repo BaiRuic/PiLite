@@ -155,5 +155,59 @@ export function registerSessionStoreContract(
         expect(secondLoad?.messages.length).toBe(4);
       });
     });
+
+    it("lists session summaries sorted by updatedAt descending and deletes sessions", async () => {
+      await withStore(async (store) => {
+        expect(await store.list()).toEqual([]);
+        expect(await store.delete("missing")).toBe(false);
+
+        const older = createSampleSnapshot({
+          sessionId: "s-old",
+          title: "Older chat",
+          createdAt: 1_000,
+          updatedAt: 1_500,
+        });
+        const newer = createSampleSnapshot({
+          sessionId: "s-new",
+          title: "Forked chat",
+          parentSessionId: "s-old",
+          status: "interrupted",
+          createdAt: 2_000,
+          updatedAt: 3_000,
+          messages: [],
+        });
+
+        await store.save(older.sessionId, older);
+        await store.save(newer.sessionId, newer);
+
+        const listed = await store.list();
+        expect(listed).toEqual([
+          {
+            sessionId: "s-new",
+            model: { provider: "faux", modelId: "faux-1" },
+            status: "interrupted",
+            title: "Forked chat",
+            parentSessionId: "s-old",
+            createdAt: 2_000,
+            updatedAt: 3_000,
+            messageCount: 0,
+          },
+          {
+            sessionId: "s-old",
+            model: { provider: "faux", modelId: "faux-1" },
+            status: "idle",
+            title: "Older chat",
+            createdAt: 1_000,
+            updatedAt: 1_500,
+            messageCount: 4,
+          },
+        ]);
+
+        expect(await store.delete("s-old")).toBe(true);
+        expect(await store.delete("s-old")).toBe(false);
+        expect(await store.load("s-old")).toBeNull();
+        expect((await store.list()).map((s) => s.sessionId)).toEqual(["s-new"]);
+      });
+    });
   });
 }

@@ -1,6 +1,6 @@
 import { validateSqliteSchemaPrefix, type SqliteDatabase, type SqliteExecutor } from "./database.js";
 
-export const CURRENT_SQLITE_SCHEMA_VERSION = 1;
+export const CURRENT_SQLITE_SCHEMA_VERSION = 2;
 
 export interface SqliteSessionSchema {
   readonly prefix: string;
@@ -45,6 +45,20 @@ export const SQLITE_MIGRATIONS: readonly SqliteMigration[] = [
           updated_at INTEGER NOT NULL,
           snapshot_json TEXT NOT NULL
         );
+      `);
+    },
+  },
+  {
+    version: 2,
+    description: "Add session summary metadata columns and updated_at index",
+    async apply(executor, schema) {
+      await executor.exec(`
+        ALTER TABLE ${schema.tables.sessions} ADD COLUMN title TEXT;
+        ALTER TABLE ${schema.tables.sessions} ADD COLUMN parent_session_id TEXT;
+        ALTER TABLE ${schema.tables.sessions} ADD COLUMN created_at INTEGER;
+        ALTER TABLE ${schema.tables.sessions} ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0;
+        CREATE INDEX IF NOT EXISTS idx_${schema.tables.sessions}_updated_at
+          ON ${schema.tables.sessions} (updated_at DESC, session_id ASC);
       `);
     },
   },

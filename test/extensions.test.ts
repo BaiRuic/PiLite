@@ -227,6 +227,8 @@ describe("Headless Extension System", () => {
         }
         await innerStore.save(id, snapshot);
       },
+      delete: (id) => innerStore.delete(id),
+      list: () => innerStore.list(),
     };
 
     const lifecycle: string[] = [];
@@ -289,6 +291,8 @@ describe("Headless Extension System", () => {
         if (saves === 2) throw new Error("final save boom");
         await origSave(id, snapshot);
       },
+      delete: (id) => flakyStore.delete(id),
+      list: () => flakyStore.list(),
     };
     const s3 = await openSession({
       sessionId: "sess-entries",
