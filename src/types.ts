@@ -6,6 +6,12 @@ import type {
   ToolExecutionMode,
 } from "@earendil-works/pi-agent-core";
 import type { ClientIdentity, Models, ThinkingBudgets } from "@earendil-works/pi-ai";
+import type {
+  ExtensionDiagnostic,
+  ExtensionExecFn,
+  ExtensionRegistration,
+  ExtensionUIAdapter,
+} from "./extensions/types.js";
 
 export const SESSION_SNAPSHOT_VERSION = 1 as const;
 
@@ -18,11 +24,19 @@ export type SessionStatus = "idle" | "running" | "aborted" | "interrupted" | "er
 
 export type SessionTerminalStatus = "idle" | "aborted" | "error";
 
+export interface CustomSessionEntry<T = unknown> {
+  readonly id: string;
+  readonly customType: string;
+  readonly data?: T;
+  readonly timestamp: number;
+}
+
 export interface SessionSnapshot {
   readonly version: typeof SESSION_SNAPSHOT_VERSION;
   readonly sessionId: string;
   readonly model: ModelRef;
   readonly messages: AgentMessage[];
+  readonly customEntries?: CustomSessionEntry[];
   readonly status: SessionStatus;
   readonly lastError?: string;
   readonly updatedAt: number;
@@ -46,6 +60,10 @@ export interface BaseSessionOptions {
   readonly store: SessionStore;
   readonly systemPrompt?: string;
   readonly tools?: readonly AgentTool<any>[];
+  readonly extensions?: readonly ExtensionRegistration[];
+  readonly ui?: ExtensionUIAdapter;
+  readonly exec?: ExtensionExecFn;
+  readonly onExtensionDiagnostic?: (diagnostic: ExtensionDiagnostic) => void;
   readonly thinkingLevel?: ThinkingLevel;
   readonly thinkingBudgets?: ThinkingBudgets;
   readonly toolExecution?: ToolExecutionMode;

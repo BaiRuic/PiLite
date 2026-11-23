@@ -10,6 +10,10 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./extensions": {
+      "types": "./dist/extensions/index.d.ts",
+      "import": "./dist/extensions/index.js"
+    },
     "./storage/memory": {
       "types": "./dist/store/memory.d.ts",
       "import": "./dist/store/memory.js"
