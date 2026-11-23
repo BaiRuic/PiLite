@@ -14,6 +14,18 @@
       "types": "./dist/store/memory.d.ts",
       "import": "./dist/store/memory.js"
     },
+    "./storage/jsonl": {
+      "types": "./dist/store/jsonl/index.d.ts",
+      "import": "./dist/store/jsonl/index.js"
+    },
+    "./storage/jsonl/node": {
+      "types": "./dist/store/jsonl/node.d.ts",
+      "import": "./dist/store/jsonl/node.js"
+    },
+    "./storage/indexeddb": {
+      "types": "./dist/store/indexeddb.d.ts",
+      "import": "./dist/store/indexeddb.js"
+    },
     "./storage/sqlite": {
       "types": "./dist/store/sqlite/index.d.ts",
       "import": "./dist/store/sqlite/index.js"
@@ -54,6 +66,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.19.19",
+    "fake-indexeddb": "^6.2.8",
     "typescript": "^5.8.3",
     "vitest": "^4.1.12"
   }
