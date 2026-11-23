@@ -41,6 +41,7 @@
     "build:bun-verify": "bun build --compile --no-compile-autoload-bunfig --no-compile-autoload-dotenv ./scripts/verify-bun-host.ts --outfile dist/verify-bun-host",
     "typecheck": "tsc --noEmit",
     "test": "pnpm build && vitest run",
+    "test:bun": "bun test test/bun-sqlite.bun.test.ts",
     "test:watch": "vitest"
   },
   "engines": {
