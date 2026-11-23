@@ -31,7 +31,7 @@
 
 ### 会话存储与恢复
 
-定义面向会话的 `SessionStore`，第一版只需要 `load(sessionId)`（不存在返回 `null`）和原子替换快照的 `save(sessionId, snapshot)`。快照包含格式版本、模型引用、消息历史和运行状态（`idle | running | aborted | interrupted | error`）。先实现内存后端用于测试，再接持久化后端；两者使用同一套契约测试。第一版不支持多个进程并发写同一会话。
+定义面向会话的 `SessionStore`，核心只需要 `load(sessionId)`（不存在返回 `null`）和原子替换快照的 `save(sessionId, snapshot)`。快照包含格式版本、模型引用、消息历史、可选扩展自定义条目（`customEntries`）和运行状态（`idle | running | aborted | interrupted | error`）。参考 `pi-durable` 的多后端 + 运行时隔离抽象，通过独立 subpath 提供内存、SQLite（可移植核心 + `node:sqlite` / `bun:sqlite` 适配器）、JSONL（可移植 `JsonlFileSystem` 核心 + `node:fs` 适配，支持崩溃半截尾行恢复与压缩）和 IndexedDB 后端，所有后端共用同一套契约测试。当前不支持多个进程并发写同一会话。
 
 - **提交粒度（Run 级）**：开始运行前，保存用户输入和 `running` 状态，保存失败就不启动运行；运行结束后，将完整消息和最终状态一次提交。流式事件可提前展示，但不代表已经持久化。这是第一版为简化原子边界的有意取舍——崩溃时不会产生半截工具调用，代价是同一次 run 中已完成的中间工具轮次也会回退。
 - **终态判定与取消**：`pi-agent-core` 会把模型错误和取消编码在末尾 `AssistantMessage.stopReason`（`"error" | "aborted"`）中，而不会让 `prompt()` reject。harness 根据取消状态与末尾 `stopReason` 写入最终状态（`idle` / `aborted` / `error`），过滤无内容且无错误信息的空 `aborted` 尾消息；保留的非空 `aborted` / `error` 消息可供宿主展示，后续请求依赖 `pi-ai` 的 `transformMessages` 自动跳过它们。`abort()` 记录启动前取消意图并等待本轮 settle 与最终保存完成后返回。
@@ -43,6 +43,13 @@
 ### 工具与 `ExecutionEnv`
 
 不内置 `read`、`write`、`edit`、`bash` 等 coding tools。自定义工具先直接注入需要的业务客户端或资源。仅当同一工具确实要跨本地工作区和远程容器运行时，再参考 `pi-durable` 的 `ExecutionEnv` 提取所需的文件或进程能力。工具运行在哪里与会话历史存在哪里是两个独立的决定。
+
+### 扩展接口（Headless）
+
+参考 `pi-coding-agent` 的扩展模型提供轻量 headless 扩展层（`ExtensionFactory = (pi) => void | Promise<void>`），由宿主以代码方式显式注册，不引入磁盘动态 `.ts` 加载（`jiti`）和 TUI 依赖：
+
+- 支持注册与动态启停工具（`registerTool`、`getActiveTools` / `setActiveTools`）、拦截与生命周期钩子（`session_start` / `session_shutdown`、`before_agent_start`、`context`、`tool_call`、`tool_result`、`before_provider_request` / `after_provider_response` 及全部 core 事件）。
+- 支持 `appendEntry` 持久化扩展自定义条目（随快照原子提交与回滚）、共享 `events` 总线，以及宿主按需注入的 `ui` / `exec` 桥接适配器；未支持的事件名接受注册并输出 `deferred_event` 诊断，不阻塞运行。
 
 ## 第一阶段验收
 
