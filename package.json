@@ -10,6 +10,22 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./storage/memory": {
+      "types": "./dist/store/memory.d.ts",
+      "import": "./dist/store/memory.js"
+    },
+    "./storage/sqlite": {
+      "types": "./dist/store/sqlite/index.d.ts",
+      "import": "./dist/store/sqlite/index.js"
+    },
+    "./storage/sqlite/node": {
+      "types": "./dist/store/sqlite/node.d.ts",
+      "import": "./dist/store/sqlite/node.js"
+    },
+    "./storage/sqlite/bun": {
+      "types": "./dist/store/sqlite/bun.d.ts",
+      "import": "./dist/store/sqlite/bun.js"
+    },
     "./testing": {
       "types": "./dist/testing.d.ts",
       "import": "./dist/testing.js"
@@ -22,8 +38,9 @@
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "pnpm clean && tsc -p tsconfig.build.json",
+    "build:bun-verify": "bun build --compile --no-compile-autoload-bunfig --no-compile-autoload-dotenv ./scripts/verify-bun-host.ts --outfile dist/verify-bun-host",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "pnpm build && vitest run",
     "test:watch": "vitest"
   },
   "engines": {
