@@ -3,7 +3,16 @@ import { createModels } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { obj, str } from "@earendil-works/pi-schema";
 import { describe, expect, it } from "vitest";
-import { createSession, InMemorySessionStore, openSession, type RetryEvent } from "../src/index.js";
+import {
+  createSession,
+  type ExtensionFactory,
+  HarnessError,
+  InMemorySessionStore,
+  openSession,
+  type RetryEvent,
+  type SessionCompactEvent,
+  type SessionCompactFailedEvent,
+} from "../src/index.js";
 
 function createTestEnv(contextWindow = 100_000) {
   const faux = fauxProvider({
@@ -325,5 +334,127 @@ describe("Auto-retry and context compaction", () => {
     expect(recovered.snapshot.messages).toHaveLength(4); // all 4 messages preserved intact
     expect(recovered.snapshot.compactions?.some((c) => c.trigger === "overflow")).toBe(true);
     expect(s2.getContextMessages()).toHaveLength(3); // summary + user("Trigger overflow") + recovered assistant
+  });
+
+  it("routes built-in and custom compaction through session_before_compact / session_compact / session_compact_failed hooks", async () => {
+    const { faux, models, store } = createTestEnv();
+    const compactEvents: SessionCompactEvent[] = [];
+    const failedEvents: SessionCompactFailedEvent[] = [];
+    let observedInstructions: string | undefined;
+    let mode: "cancel" | "instructions" | "custom" | "bad-cut" | "throw" = "cancel";
+
+    const lookupTool: AgentTool = {
+      name: "lookup",
+      label: "Lookup",
+      description: "Read-only lookup",
+      parameters: obj({ k: str() }),
+      execute: async (_id, params) => ({
+        content: [{ type: "text", text: `val:${(params as { k: string }).k}` }],
+        details: {},
+      }),
+    };
+
+    const compactionExt: ExtensionFactory = (pi) => {
+      pi.on("session_before_compact", (event) => {
+        if (mode === "cancel") {
+          return { cancel: true };
+        }
+        if (mode === "instructions") {
+          return { customInstructions: "Preserve all citations and DOIs" };
+        }
+        if (mode === "custom") {
+          return {
+            compaction: {
+              summary: `Custom summary covering ${event.preparation.messagesToSummarize.length} msgs`,
+              firstKeptIndex: event.preparation.firstKeptIndex,
+              details: { citations: ["doi:10.1000/xyz"] },
+            },
+          };
+        }
+        if (mode === "bad-cut") {
+          // Index right on a toolResult message splits the preceding toolCall from its toolResult.
+          const toolResultIdx = event.messages.findIndex((m) => m.role === "toolResult");
+          return { compaction: { summary: "Invalid cut", firstKeptIndex: toolResultIdx } };
+        }
+        throw new Error("custom summarizer exploded");
+      });
+      pi.on("session_compact", (event) => {
+        compactEvents.push(event);
+      });
+      pi.on("session_compact_failed", (event) => {
+        failedEvents.push(event);
+      });
+    };
+
+    faux.setResponses([
+      fauxAssistantMessage(`Turn 1 reply ${"a".repeat(200)}`),
+      fauxAssistantMessage(fauxToolCall("lookup", { k: "paper" }, { id: "tc-1" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("Turn 2 final reply"),
+      fauxAssistantMessage(`Turn 3 reply ${"b".repeat(200)}`),
+    ]);
+
+    const session = await createSession({
+      sessionId: "sess-compact-hooks",
+      models,
+      store,
+      model: { provider: "faux", modelId: "faux-1" },
+      tools: [lookupTool],
+      extensions: [compactionExt],
+      compaction: {
+        summarizer: async ({ instructions }) => {
+          observedInstructions = instructions;
+          return "Built-in summary with custom instructions";
+        },
+      },
+    });
+
+    await session.prompt(`Q1 ${"1".repeat(120)}`);
+    await session.prompt("Lookup paper");
+    await session.prompt(`Q3 ${"3".repeat(120)}`);
+
+    // 1. Extension cancels compaction cleanly.
+    mode = "cancel";
+    const cancelled = await session.compact({ keepRecentTokens: 40 });
+    expect(cancelled.compacted).toBe(false);
+    expect(compactEvents).toHaveLength(0);
+
+    // 2. Extension overrides customInstructions; built-in compaction extension produces the summary (fromExtension=false).
+    mode = "instructions";
+    const withInstr = await session.compact({ keepRecentTokens: 40 });
+    expect(withInstr.compacted).toBe(true);
+    expect(observedInstructions).toBe("Preserve all citations and DOIs");
+    expect(compactEvents).toHaveLength(1);
+    expect(compactEvents[0]?.fromExtension).toBe(false);
+    expect(compactEvents[0]?.reason).toBe("manual");
+
+    // 3. Extension supplies custom summary + structured details (fromExtension=true).
+    await session.prompt(`Q4 ${"4".repeat(120)}`);
+    faux.setResponses([fauxAssistantMessage(`Turn 4 reply ${"c".repeat(200)}`)]);
+    // Also add one more turn so a second compaction has fresh messages to summarize.
+    await session.prompt(`Q5 ${"5".repeat(120)}`);
+    mode = "custom";
+    const custom = await session.compact({ keepRecentTokens: 40 });
+    expect(custom.compacted).toBe(true);
+    expect(custom.checkpoint?.details).toEqual({ citations: ["doi:10.1000/xyz"] });
+    expect(compactEvents).toHaveLength(2);
+    expect(compactEvents[1]?.fromExtension).toBe(true);
+    expect(session.getSnapshot().compactions?.at(-1)?.details).toEqual({ citations: ["doi:10.1000/xyz"] });
+
+    // 4. Extension returns an unsafe firstKeptIndex splitting toolCall/toolResult -> rejected & emits session_compact_failed.
+    faux.setResponses([fauxAssistantMessage(`Turn 6 reply ${"d".repeat(200)}`)]);
+    await session.prompt(`Q6 ${"6".repeat(120)}`);
+    mode = "bad-cut";
+    await expect(session.compact({ keepRecentTokens: 40 })).rejects.toBeInstanceOf(HarnessError);
+    expect(failedEvents).toHaveLength(1);
+    expect(failedEvents[0]?.fromExtension).toBe(true);
+    expect(failedEvents[0]?.aborted).toBe(false);
+    expect(failedEvents[0]?.errorMessage).toMatch(/firstKeptIndex/i);
+
+    // 5. Extension throws -> emits session_compact_failed and propagates error.
+    mode = "throw";
+    await expect(session.compact({ keepRecentTokens: 40 })).rejects.toThrow("custom summarizer exploded");
+    expect(failedEvents).toHaveLength(2);
+    expect(failedEvents[1]?.fromExtension).toBe(true);
+    expect(failedEvents[1]?.errorMessage).toBe("custom summarizer exploded");
   });
 });

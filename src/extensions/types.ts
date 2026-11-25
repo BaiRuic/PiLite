@@ -8,6 +8,7 @@ import type {
 } from "@earendil-works/pi-agent-core";
 import type { Api, ImageContent, Model, TextContent } from "@earendil-works/pi-ai";
 import type { Static } from "@earendil-works/pi-schema";
+import type { CompactionCheckpoint, CompactionPreparation, CompactionTrigger } from "../compaction.js";
 import type { CustomSessionEntry, SessionSnapshot } from "../types.js";
 
 export interface ExtensionUIDialogOptions {
@@ -113,6 +114,55 @@ export interface SessionShutdownExtensionEvent {
   readonly type: "session_shutdown";
 }
 
+/** Fired before context compaction (can cancel, adjust instructions, or provide a custom summary). */
+export interface SessionBeforeCompactEvent {
+  readonly type: "session_before_compact";
+  readonly preparation: CompactionPreparation;
+  /** Full append-only session transcript at the compaction point. */
+  readonly messages: AgentMessage[];
+  readonly customInstructions?: string;
+  readonly reason: CompactionTrigger;
+  /** True when an overflowed turn will be retried immediately after this compaction. */
+  readonly willRetry: boolean;
+  readonly signal?: AbortSignal;
+}
+
+export interface SessionBeforeCompactResult {
+  /** Cancel this compaction cleanly without error. */
+  readonly cancel?: boolean;
+  /** Custom compaction output produced by the extension (skips downstream summarizers). */
+  readonly compaction?: {
+    readonly summary: string;
+    /** Optional custom cut index in `event.messages` (validated against `isSafeForkBoundary`). */
+    readonly firstKeptIndex?: number;
+    /** Optional extension-specific metadata persisted on the `CompactionCheckpoint`. */
+    readonly details?: unknown;
+  };
+  /** Override instructions forwarded to downstream `session_before_compact` handlers. */
+  readonly customInstructions?: string;
+}
+
+/** Fired after a compaction checkpoint has been committed/applied. */
+export interface SessionCompactEvent {
+  readonly type: "session_compact";
+  readonly checkpoint: CompactionCheckpoint;
+  /** True when the compaction summary came from a user-registered extension handler. */
+  readonly fromExtension: boolean;
+  readonly reason: CompactionTrigger;
+  readonly willRetry: boolean;
+}
+
+/** Fired when compaction fails or is aborted. */
+export interface SessionCompactFailedEvent {
+  readonly type: "session_compact_failed";
+  readonly reason: CompactionTrigger;
+  readonly errorMessage?: string;
+  readonly aborted: boolean;
+  readonly willRetry: boolean;
+  /** True when the failure originated in a user-registered `session_before_compact` handler. */
+  readonly fromExtension: boolean;
+}
+
 export interface BeforeAgentStartEvent {
   readonly type: "before_agent_start";
   readonly prompt: string;
@@ -189,6 +239,9 @@ type AgentEventByType = {
 export interface ExtensionEventMap extends AgentEventByType {
   session_start: SessionStartExtensionEvent;
   session_shutdown: SessionShutdownExtensionEvent;
+  session_before_compact: SessionBeforeCompactEvent;
+  session_compact: SessionCompactEvent;
+  session_compact_failed: SessionCompactFailedEvent;
   before_agent_start: BeforeAgentStartEvent;
   context: ContextExtensionEvent;
   before_provider_request: BeforeProviderRequestEvent;
@@ -200,6 +253,9 @@ export interface ExtensionEventMap extends AgentEventByType {
 export interface ExtensionEventResultMap {
   session_start: void;
   session_shutdown: void;
+  session_before_compact: SessionBeforeCompactResult | void;
+  session_compact: void;
+  session_compact_failed: void;
   before_agent_start: BeforeAgentStartResult | void;
   context: ContextExtensionResult | void;
   before_provider_request: BeforeProviderRequestResult | void;

@@ -25,15 +25,19 @@ import {
 import {
   type CompactionCheckpoint,
   type CompactionOptions,
+  type CompactionPreparation,
   type CompactionRequestOptions,
   type CompactionResult,
   type CompactionTrigger,
-  defaultSummarizeMessages,
   estimateTranscriptTokens,
   isSafeForkBoundary,
   planCompaction,
   projectContextMessages,
 } from "./compaction.js";
+import {
+  BUILTIN_COMPACTION_EXTENSION_NAME,
+  createDefaultCompactionExtension,
+} from "./extensions/default-compaction.js";
 import { ExtensionRunner } from "./extensions/runner.js";
 import { buildSystemPromptPatch, createInitialTranscript } from "./system-prompt.js";
 import {
@@ -135,6 +139,22 @@ function generateRandomId(): string {
 
 function resolveModels(source: ModelsProvider): Models {
   return typeof source === "function" ? source() : source;
+}
+
+function loadSessionExtensions(options: BaseSessionOptions): Promise<ExtensionRunner> {
+  const builtinCompaction = {
+    name: BUILTIN_COMPACTION_EXTENSION_NAME,
+    factory: createDefaultCompactionExtension({
+      getModels: () => resolveModels(options.models),
+      identity: options.identity ?? DEFAULT_HARNESS_IDENTITY,
+      summarizer: options.compaction?.summarizer,
+    }),
+  };
+  return ExtensionRunner.load({
+    extensions: [...(options.extensions ?? []), builtinCompaction],
+    baseTools: options.tools ?? [],
+    onDiagnostic: options.onExtensionDiagnostic,
+  });
 }
 
 function resolveModelOrThrow(models: Models, ref: ModelRef): Model<Api> {
@@ -496,11 +516,7 @@ export class HarnessSession {
       throw new HarnessError("SESSION_EXISTS", `Session "${sessionId}" already exists.`);
     }
 
-    const extensions = await ExtensionRunner.load({
-      extensions: options.extensions ?? [],
-      baseTools: options.tools ?? [],
-      onDiagnostic: options.onExtensionDiagnostic,
-    });
+    const extensions = await loadSessionExtensions(options);
 
     const timestamp = now();
     const thinkingLevel = options.thinkingLevel ?? "off";
@@ -554,11 +570,7 @@ export class HarnessSession {
     const resolvedModel = resolveModels(options.models).getModel(loaded.model.provider, loaded.model.modelId);
     const thinkingLevel = options.thinkingLevel ?? loaded.thinkingLevel ?? "off";
 
-    const extensions = await ExtensionRunner.load({
-      extensions: options.extensions ?? [],
-      baseTools: options.tools ?? [],
-      onDiagnostic: options.onExtensionDiagnostic,
-    });
+    const extensions = await loadSessionExtensions(options);
 
     let snapshot = loaded;
     if (loaded.status === "running") {
@@ -829,11 +841,7 @@ export class HarnessSession {
     }
 
     const resolvedModel = this.resolvedModel;
-    const forkedExtensions = await ExtensionRunner.load({
-      extensions: this.baseOptions.extensions ?? [],
-      baseTools: this.baseOptions.tools ?? [],
-      onDiagnostic: this.baseOptions.onExtensionDiagnostic,
-    });
+    const forkedExtensions = await loadSessionExtensions(this.baseOptions);
     forkedExtensions.setActiveToolNames(this.getActiveTools());
 
     const timestamp = this.now();
@@ -892,6 +900,7 @@ export class HarnessSession {
       compactions: this.compactionCheckpoints,
       keepRecentTokens,
       trigger: "manual",
+      willRetry: false,
       instructions: options.instructions,
     });
     if (!outcome.compacted) {
@@ -910,6 +919,13 @@ export class HarnessSession {
     this.compactionCheckpoints = nextCompactions;
     this.agent.state.messages = structuredClone(outcome.nextContextMessages);
     this.committedSnapshot = structuredClone(updated);
+    await this.extensions.emitSessionCompact({
+      type: "session_compact",
+      checkpoint: structuredClone(outcome.checkpoint),
+      fromExtension: outcome.fromExtension,
+      reason: "manual",
+      willRetry: false,
+    });
     return outcome.result;
   }
 
@@ -1083,6 +1099,7 @@ export class HarnessSession {
     readonly compactions: readonly CompactionCheckpoint[];
     readonly keepRecentTokens: number;
     readonly trigger: CompactionTrigger;
+    readonly willRetry: boolean;
     readonly instructions: string | undefined;
     readonly signal?: AbortSignal;
   }): Promise<
@@ -1091,6 +1108,7 @@ export class HarnessSession {
         readonly compacted: true;
         readonly checkpoint: CompactionCheckpoint;
         readonly nextContextMessages: AgentMessage[];
+        readonly fromExtension: boolean;
         readonly result: CompactionResult;
       }
   > {
@@ -1110,33 +1128,119 @@ export class HarnessSession {
       };
     }
 
-    const summary = this.compaction?.summarizer
-      ? await this.compaction.summarizer({
-          messages: structuredClone(plan.toSummarize),
-          instructions: params.instructions,
-          model: this.agent.state.model,
-          signal: params.signal,
-        })
-      : await defaultSummarizeMessages({
-          models: this.getModels(),
-          model: this.agent.state.model,
-          messages: plan.toSummarize,
-          instructions: params.instructions,
-          identity: this.identity,
-          signal: params.signal,
-        });
+    const preparation: CompactionPreparation = {
+      firstKeptIndex: plan.firstKeptIndex,
+      compactedAtIndex: plan.compactedAtIndex,
+      messagesToSummarize: structuredClone(plan.toSummarize),
+      keptMessages: structuredClone(plan.kept),
+      tokensBefore,
+      ...(plan.previousSummary !== undefined ? { previousSummary: plan.previousSummary } : {}),
+    };
+
+    const hookResult = await this.extensions.emitSessionBeforeCompact({
+      type: "session_before_compact",
+      preparation,
+      messages: structuredClone([...params.fullMessages]),
+      ...(params.instructions !== undefined ? { customInstructions: params.instructions } : {}),
+      reason: params.trigger,
+      willRetry: params.willRetry,
+      ...(params.signal !== undefined ? { signal: params.signal } : {}),
+    });
+
+    if (hookResult.outcome === "cancelled" || hookResult.outcome === "none") {
+      return {
+        compacted: false,
+        result: {
+          compacted: false,
+          compactedMessages: 0,
+          keptMessages: currentContext.filter((m) => m.role !== "system").length,
+          tokensBefore,
+          tokensAfter: tokensBefore,
+        },
+      };
+    }
+
+    if (hookResult.outcome === "failed") {
+      const error = hookResult.error;
+      const aborted =
+        params.signal?.aborted === true || (error instanceof Error && error.name === "AbortError");
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      await this.extensions.emitSessionCompactFailed({
+        type: "session_compact_failed",
+        reason: params.trigger,
+        ...(!aborted ? { errorMessage } : {}),
+        aborted,
+        willRetry: params.willRetry,
+        fromExtension: hookResult.fromExtension,
+      });
+      throw error;
+    }
+
+    const { compaction: extCompaction, fromExtension } = hookResult;
+    const summary = extCompaction.summary.trim();
+    if (!summary) {
+      const error = new HarnessError(
+        "INVALID_OPTIONS",
+        "Compaction handler returned an empty summary string.",
+      );
+      await this.extensions.emitSessionCompactFailed({
+        type: "session_compact_failed",
+        reason: params.trigger,
+        errorMessage: error.message,
+        aborted: false,
+        willRetry: params.willRetry,
+        fromExtension,
+      });
+      throw error;
+    }
+
+    const firstKeptIndex = extCompaction.firstKeptIndex ?? plan.firstKeptIndex;
+    if (
+      !Number.isSafeInteger(firstKeptIndex) ||
+      firstKeptIndex < 0 ||
+      firstKeptIndex > params.fullMessages.length ||
+      !isSafeForkBoundary(params.fullMessages, firstKeptIndex)
+    ) {
+      const error = new HarnessError(
+        "INVALID_OPTIONS",
+        `Invalid compaction firstKeptIndex (${String(firstKeptIndex)}): out of bounds or splits a toolCall/toolResult pair.`,
+      );
+      await this.extensions.emitSessionCompactFailed({
+        type: "session_compact_failed",
+        reason: params.trigger,
+        errorMessage: error.message,
+        aborted: false,
+        willRetry: params.willRetry,
+        fromExtension,
+      });
+      throw error;
+    }
+
+    const latestPrior =
+      params.compactions.length > 0 ? params.compactions[params.compactions.length - 1] : undefined;
+    const activeStart = latestPrior ? Math.max(0, Math.min(latestPrior.firstKeptIndex, firstKeptIndex)) : 0;
+    const compactedMessages =
+      extCompaction.firstKeptIndex === undefined
+        ? plan.toSummarize.length
+        : params.fullMessages.slice(activeStart, firstKeptIndex).filter((m) => m.role !== "system").length +
+          (latestPrior ? 1 : 0);
+    const keptMessages =
+      extCompaction.firstKeptIndex === undefined
+        ? plan.kept.length
+        : params.fullMessages.slice(firstKeptIndex).filter((m) => m.role !== "system").length;
 
     const timestamp = this.now();
     const draftCheckpoint: CompactionCheckpoint = {
       id: generateRandomId(),
-      firstKeptIndex: plan.firstKeptIndex,
+      firstKeptIndex,
       compactedAtIndex: plan.compactedAtIndex,
       summary,
       trigger: params.trigger,
-      compactedMessages: plan.toSummarize.length,
-      keptMessages: plan.kept.length,
+      compactedMessages,
+      keptMessages,
       tokensBefore,
       tokensAfter: 0,
+      ...(extCompaction.details !== undefined ? { details: structuredClone(extCompaction.details) } : {}),
       timestamp,
     };
     const nextContextMessages = projectContextMessages(params.fullMessages, [
@@ -1150,12 +1254,13 @@ export class HarnessSession {
       compacted: true,
       checkpoint,
       nextContextMessages,
+      fromExtension,
       result: {
         compacted: true,
         summary,
         checkpoint: structuredClone(checkpoint),
-        compactedMessages: plan.toSummarize.length,
-        keptMessages: plan.kept.length,
+        compactedMessages,
+        keptMessages,
         tokensBefore,
         tokensAfter,
       },
@@ -1295,6 +1400,7 @@ export class HarnessSession {
           compactions: this.compactionCheckpoints,
           keepRecentTokens,
           trigger: "threshold",
+          willRetry: false,
           instructions: undefined,
           signal: runHandle.abortController.signal,
         });
@@ -1308,6 +1414,13 @@ export class HarnessSession {
               this.compactionCheckpoints,
             ),
           };
+          await this.extensions.emitSessionCompact({
+            type: "session_compact",
+            checkpoint: structuredClone(compacted.checkpoint),
+            fromExtension: compacted.fromExtension,
+            reason: "threshold",
+            willRetry: false,
+          });
         }
       }
     }
@@ -1398,6 +1511,7 @@ export class HarnessSession {
           compactions: this.compactionCheckpoints,
           keepRecentTokens,
           trigger: "overflow",
+          willRetry: true,
           instructions: undefined,
           signal: runHandle.abortController.signal,
         });
@@ -1405,6 +1519,13 @@ export class HarnessSession {
           runFullMessages = candidateFullMessages;
           this.compactionCheckpoints = [...this.compactionCheckpoints, compacted.checkpoint];
           this.agent.state.messages = structuredClone(compacted.nextContextMessages);
+          await this.extensions.emitSessionCompact({
+            type: "session_compact",
+            checkpoint: structuredClone(compacted.checkpoint),
+            fromExtension: compacted.fromExtension,
+            reason: "overflow",
+            willRetry: true,
+          });
           continue;
         }
       }

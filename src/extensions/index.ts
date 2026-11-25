@@ -1,3 +1,8 @@
+export {
+  BUILTIN_COMPACTION_EXTENSION_NAME,
+  createDefaultCompactionExtension,
+  type DefaultCompactionExtensionOptions,
+} from "./default-compaction.js";
 export { type ExtensionHostBindings, ExtensionRunner } from "./runner.js";
 export {
   type AfterProviderResponseEvent,
@@ -26,6 +31,10 @@ export {
   type ExtensionUIAdapter,
   type ExtensionUIContext,
   type ExtensionUIDialogOptions,
+  type SessionBeforeCompactEvent,
+  type SessionBeforeCompactResult,
+  type SessionCompactEvent,
+  type SessionCompactFailedEvent,
   type SessionShutdownExtensionEvent,
   type SessionStartExtensionEvent,
   type ToolCallExtensionEvent,

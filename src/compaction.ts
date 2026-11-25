@@ -39,7 +39,28 @@ export interface CompactionCheckpoint {
   readonly keptMessages: number;
   readonly tokensBefore: number;
   readonly tokensAfter: number;
+  /** Optional extension-specific metadata persisted alongside this checkpoint. */
+  readonly details?: unknown;
   readonly timestamp: number;
+}
+
+/**
+ * Inputs prepared by the harness before firing `session_before_compact`.
+ * Mirrors `pi-coding-agent`'s `CompactionPreparation` without tree/file-op coupling.
+ */
+export interface CompactionPreparation {
+  /** Index in `SessionSnapshot.messages` of the first message kept verbatim. */
+  readonly firstKeptIndex: number;
+  /** Index in `SessionSnapshot.messages` where compaction occurred (`messages.length`). */
+  readonly compactedAtIndex: number;
+  /** Messages selected to be summarized (includes the previous summary when compacting again). */
+  readonly messagesToSummarize: AgentMessage[];
+  /** Recent non-system messages kept verbatim after the checkpoint. */
+  readonly keptMessages: AgentMessage[];
+  /** Estimated token count of the effective model context before compaction. */
+  readonly tokensBefore: number;
+  /** Summary from the previous compaction checkpoint, if any. */
+  readonly previousSummary?: string;
 }
 
 export interface CompactionSummarizerInput {
@@ -206,6 +227,8 @@ export interface CompactionPlan {
   readonly firstKeptIndex: number;
   /** Index in the full transcript where compaction was recorded (`messages.length`). */
   readonly compactedAtIndex: number;
+  /** Summary from the previous compaction checkpoint, if any. */
+  readonly previousSummary?: string;
 }
 
 /**
@@ -271,6 +294,7 @@ export function planCompaction(
     kept: keptItems.map((item) => item.message),
     firstKeptIndex,
     compactedAtIndex: messages.length,
+    ...(latest ? { previousSummary: latest.summary } : {}),
   };
 }
 

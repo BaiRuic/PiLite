@@ -8,6 +8,7 @@ import type {
 } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { CustomSessionEntry, SessionSnapshot } from "../types.js";
+import { BUILTIN_COMPACTION_EXTENSION_NAME } from "./default-compaction.js";
 import type {
   BeforeAgentStartEvent,
   BeforeAgentStartResult,
@@ -26,6 +27,10 @@ import type {
   ExtensionToolDefinition,
   ExtensionUIAdapter,
   ExtensionUIContext,
+  SessionBeforeCompactEvent,
+  SessionBeforeCompactResult,
+  SessionCompactEvent,
+  SessionCompactFailedEvent,
   ToolCallExtensionEvent,
   ToolCallExtensionResult,
   ToolResultExtensionEvent,
@@ -35,6 +40,9 @@ import type {
 const SUPPORTED_EVENTS = new Set<string>([
   "session_start",
   "session_shutdown",
+  "session_before_compact",
+  "session_compact",
+  "session_compact_failed",
   "before_agent_start",
   "context",
   "before_provider_request",
@@ -231,6 +239,74 @@ export class ExtensionRunner {
 
   async emitSessionShutdown(): Promise<void> {
     await this.emitNotification("session_shutdown", { type: "session_shutdown" });
+  }
+
+  async emitSessionBeforeCompact(event: SessionBeforeCompactEvent): Promise<
+    | { readonly outcome: "cancelled"; readonly fromExtension: boolean }
+    | {
+        readonly outcome: "compacted";
+        readonly compaction: NonNullable<SessionBeforeCompactResult["compaction"]>;
+        readonly fromExtension: boolean;
+      }
+    | {
+        readonly outcome: "failed";
+        readonly error: unknown;
+        readonly fromExtension: boolean;
+      }
+    | { readonly outcome: "none"; readonly customInstructions?: string }
+  > {
+    const list = this.handlers.get("session_before_compact");
+    if (!list || list.length === 0) {
+      return {
+        outcome: "none",
+        ...(event.customInstructions !== undefined ? { customInstructions: event.customInstructions } : {}),
+      };
+    }
+
+    const ctx = this.createContext();
+    let currentInstructions = event.customInstructions;
+
+    for (const handler of [...list]) {
+      const fromExtension = handler.extensionName !== BUILTIN_COMPACTION_EXTENSION_NAME;
+      try {
+        const result = (await handler.fn(
+          {
+            ...event,
+            ...(currentInstructions !== undefined ? { customInstructions: currentInstructions } : {}),
+          },
+          ctx,
+        )) as SessionBeforeCompactResult | undefined;
+
+        if (!result) continue;
+        if (result.cancel) {
+          return { outcome: "cancelled", fromExtension };
+        }
+        if (result.compaction !== undefined) {
+          return { outcome: "compacted", compaction: result.compaction, fromExtension };
+        }
+        if (result.customInstructions !== undefined) {
+          currentInstructions = result.customInstructions;
+        }
+      } catch (error) {
+        if (fromExtension) {
+          this.reportHandlerError(handler.extensionName, "session_before_compact", error);
+        }
+        return { outcome: "failed", error, fromExtension };
+      }
+    }
+
+    return {
+      outcome: "none",
+      ...(currentInstructions !== undefined ? { customInstructions: currentInstructions } : {}),
+    };
+  }
+
+  async emitSessionCompact(event: SessionCompactEvent): Promise<void> {
+    await this.emitNotification("session_compact", event);
+  }
+
+  async emitSessionCompactFailed(event: SessionCompactFailedEvent): Promise<void> {
+    await this.emitNotification("session_compact_failed", event);
   }
 
   async emitAgentEvent(event: AgentEvent): Promise<void> {
