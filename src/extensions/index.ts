@@ -8,6 +8,7 @@ export {
   type BeforeProviderRequestResult,
   type ContextExtensionEvent,
   type ContextExtensionResult,
+  type ExecuteToolOptions,
   type ExtensionAPI,
   type ExtensionContext,
   type ExtensionDiagnostic,

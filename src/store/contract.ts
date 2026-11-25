@@ -158,7 +158,7 @@ export function registerSessionStoreContract(
 
     it("lists session summaries sorted by updatedAt descending and deletes sessions", async () => {
       await withStore(async (store) => {
-        expect(await store.list()).toEqual([]);
+        expect(await store.list()).toEqual({ items: [] });
         expect(await store.delete("missing")).toBe(false);
 
         const older = createSampleSnapshot({
@@ -181,32 +181,109 @@ export function registerSessionStoreContract(
         await store.save(newer.sessionId, newer);
 
         const listed = await store.list();
-        expect(listed).toEqual([
-          {
-            sessionId: "s-new",
-            model: { provider: "faux", modelId: "faux-1" },
-            status: "interrupted",
-            title: "Forked chat",
-            parentSessionId: "s-old",
-            createdAt: 2_000,
-            updatedAt: 3_000,
-            messageCount: 0,
-          },
-          {
-            sessionId: "s-old",
-            model: { provider: "faux", modelId: "faux-1" },
-            status: "idle",
-            title: "Older chat",
-            createdAt: 1_000,
-            updatedAt: 1_500,
-            messageCount: 4,
-          },
-        ]);
+        expect(listed).toEqual({
+          items: [
+            {
+              sessionId: "s-new",
+              model: { provider: "faux", modelId: "faux-1" },
+              status: "interrupted",
+              title: "Forked chat",
+              parentSessionId: "s-old",
+              createdAt: 2_000,
+              updatedAt: 3_000,
+              messageCount: 0,
+            },
+            {
+              sessionId: "s-old",
+              model: { provider: "faux", modelId: "faux-1" },
+              status: "idle",
+              title: "Older chat",
+              createdAt: 1_000,
+              updatedAt: 1_500,
+              messageCount: 4,
+            },
+          ],
+        });
 
         expect(await store.delete("s-old")).toBe(true);
         expect(await store.delete("s-old")).toBe(false);
         expect(await store.load("s-old")).toBeNull();
-        expect((await store.list()).map((s) => s.sessionId)).toEqual(["s-new"]);
+        expect((await store.list()).items.map((s) => s.sessionId)).toEqual(["s-new"]);
+      });
+    });
+
+    it("supports filtering by parentSessionId/status, cursor pagination, and rejects invalid queries", async () => {
+      await withStore(async (store) => {
+        const fixtures = [
+          createSampleSnapshot({ sessionId: "s-1", status: "idle", updatedAt: 5_000 }),
+          createSampleSnapshot({
+            sessionId: "s-2",
+            parentSessionId: "s-1",
+            status: "idle",
+            updatedAt: 4_000,
+          }),
+          createSampleSnapshot({
+            sessionId: "s-3",
+            parentSessionId: "s-1",
+            status: "error",
+            updatedAt: 4_000,
+          }),
+          createSampleSnapshot({
+            sessionId: "s-4",
+            parentSessionId: "s-1",
+            status: "idle",
+            updatedAt: 3_000,
+          }),
+          createSampleSnapshot({ sessionId: "s-5", status: "error", updatedAt: 2_000 }),
+        ];
+
+        for (const snap of fixtures) {
+          await store.save(snap.sessionId, snap);
+        }
+
+        // Filter by parentSessionId.
+        const children = await store.list({ parentSessionId: "s-1" });
+        expect(children.items.map((s) => s.sessionId)).toEqual(["s-2", "s-3", "s-4"]);
+        expect(children.nextCursor).toBe(undefined);
+
+        // Filter by status.
+        const errored = await store.list({ status: "error" });
+        expect(errored.items.map((s) => s.sessionId)).toEqual(["s-3", "s-5"]);
+
+        // Combined filter.
+        const idleChildren = await store.list({ parentSessionId: "s-1", status: "idle" });
+        expect(idleChildren.items.map((s) => s.sessionId)).toEqual(["s-2", "s-4"]);
+
+        // Paginate all 5 items in pages of 2 (verifies tie-breaking when s-2 & s-3 share updatedAt=4_000).
+        const collected: string[] = [];
+        let cursor: string | undefined;
+        let pageCount = 0;
+        do {
+          const page = await store.list({ limit: 2, ...(cursor !== undefined ? { cursor } : {}) });
+          collected.push(...page.items.map((s) => s.sessionId));
+          cursor = page.nextCursor;
+          pageCount += 1;
+        } while (cursor !== undefined);
+
+        expect(pageCount).toBe(3);
+        expect(collected).toEqual(["s-1", "s-2", "s-3", "s-4", "s-5"]);
+
+        // Invalid limit and cursor must reject with INVALID_OPTIONS.
+        const assertInvalid = async (promise: Promise<unknown>) => {
+          let code: unknown;
+          try {
+            await promise;
+          } catch (error) {
+            code = (error as { code?: unknown })?.code;
+          }
+          expect(code).toBe("INVALID_OPTIONS");
+        };
+
+        await assertInvalid(store.list({ limit: 0 }));
+        await assertInvalid(store.list({ limit: -3 }));
+        await assertInvalid(store.list({ limit: 1.5 }));
+        await assertInvalid(store.list({ cursor: "" }));
+        await assertInvalid(store.list({ cursor: "not-a-valid-cursor!!!" }));
       });
     });
   });

@@ -3,6 +3,7 @@ import type {
   AgentEvent,
   AgentMessage,
   AgentTool,
+  AgentToolCallOutcome,
   BeforeToolCallResult,
 } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
@@ -12,6 +13,7 @@ import type {
   BeforeAgentStartResult,
   BeforeProviderRequestResult,
   ContextExtensionResult,
+  ExecuteToolOptions,
   ExtensionAPI,
   ExtensionContext,
   ExtensionDiagnostic,
@@ -69,6 +71,12 @@ export interface ExtensionHostBindings {
   isIdle(): boolean;
   getSignal(): AbortSignal | undefined;
   abort(): void;
+  executeTool(
+    name: string,
+    args: Record<string, unknown>,
+    options: ExecuteToolOptions | undefined,
+    parentToolCallId: string | undefined,
+  ): Promise<AgentToolCallOutcome>;
   onActiveToolsChanged(tools: AgentTool<any>[]): void;
 }
 
@@ -189,6 +197,10 @@ export class ExtensionRunner {
 
   getAllToolNames(): string[] {
     return [...this.tools.keys()];
+  }
+
+  getAllAgentTools(): AgentTool<any>[] {
+    return [...this.tools.values()];
   }
 
   getActiveAgentTools(): AgentTool<any>[] {
@@ -430,7 +442,7 @@ export class ExtensionRunner {
           parameters: definition.parameters,
           ...(definition.executionMode !== undefined ? { executionMode: definition.executionMode } : {}),
           execute: (toolCallId, params, signal, onUpdate) =>
-            definition.execute(toolCallId, params, signal, onUpdate, this.createContext()),
+            definition.execute(toolCallId, params, signal, onUpdate, this.createContext(toolCallId)),
         };
         const existed = this.tools.has(definition.name);
         this.tools.set(definition.name, wrapped);
@@ -463,7 +475,7 @@ export class ExtensionRunner {
     };
   }
 
-  private createContext(): ExtensionContext {
+  private createContext(parentToolCallId?: string): ExtensionContext {
     const bindings = this.requireBindings();
     const { hasUI, ui } = createUIContext(bindings.ui);
     return {
@@ -477,6 +489,7 @@ export class ExtensionRunner {
       isIdle: () => bindings.isIdle(),
       getSignal: () => bindings.getSignal(),
       abort: () => bindings.abort(),
+      executeTool: (name, args, options) => bindings.executeTool(name, args, options, parentToolCallId),
     };
   }
 

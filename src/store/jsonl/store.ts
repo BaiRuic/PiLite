@@ -1,10 +1,12 @@
 import {
-  sortSessionSummaries,
   summarizeSnapshot,
+  type SessionListPage,
+  type SessionListQuery,
   type SessionSnapshot,
   type SessionStore,
   type SessionSummary,
 } from "../../types.js";
+import { filterAndPaginateSummaries, validateSessionListQuery } from "../query.js";
 import { SerialOperationQueue } from "../sqlite/database.js";
 import type { JsonlFileSystem } from "./filesystem.js";
 
@@ -292,8 +294,9 @@ export class JsonlSessionStore implements SessionStore {
     });
   }
 
-  async list(): Promise<SessionSummary[]> {
+  async list(query?: SessionListQuery): Promise<SessionListPage> {
     this.assertOpen();
+    validateSessionListQuery(query);
     const files = await this.fs.listFiles(this.directory);
     const summaries: SessionSummary[] = [];
     for (const fileName of files) {
@@ -306,7 +309,7 @@ export class JsonlSessionStore implements SessionStore {
         summaries.push(summarizeSnapshot(parsed.latestSnapshot));
       }
     }
-    return sortSessionSummaries(summaries);
+    return filterAndPaginateSummaries(summaries, query);
   }
 
   async close(): Promise<void> {

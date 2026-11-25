@@ -20,6 +20,7 @@ export {
   type BeforeProviderRequestResult,
   type ContextExtensionEvent,
   type ContextExtensionResult,
+  type ExecuteToolOptions,
   type ExtensionAPI,
   type ExtensionContext,
   type ExtensionDiagnostic,
@@ -48,6 +49,13 @@ export {
 export { HarnessSession, createSession, openSession } from "./session.js";
 export { InMemorySessionStore } from "./store/memory.js";
 export {
+  decodeSessionCursor,
+  encodeSessionCursor,
+  filterAndPaginateSummaries,
+  validateSessionListQuery,
+  type DecodedSessionCursor,
+} from "./store/query.js";
+export {
   HarnessError,
   SESSION_SNAPSHOT_VERSION,
   sortSessionSummaries,
@@ -58,10 +66,13 @@ export {
   type ForkSessionOptions,
   type HarnessErrorCode,
   type ModelRef,
+  type ModelsProvider,
   type OpenSessionOptions,
   type RetryEvent,
   type RetryOptions,
   type SessionEventListener,
+  type SessionListPage,
+  type SessionListQuery,
   type SessionRunResult,
   type SessionSnapshot,
   type SessionStats,

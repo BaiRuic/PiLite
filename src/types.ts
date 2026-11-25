@@ -2,6 +2,7 @@ import type {
   AgentEvent,
   AgentMessage,
   AgentTool,
+  QueueMode,
   ThinkingLevel,
   ToolExecutionMode,
 } from "@earendil-works/pi-agent-core";
@@ -15,6 +16,9 @@ import type {
 import type { CompactionOptions } from "./compaction.js";
 
 export const SESSION_SNAPSHOT_VERSION = 1 as const;
+
+/** Static `Models` instance or getter invoked per request for hot-swapping providers/credentials. */
+export type ModelsProvider = Models | (() => Models);
 
 export interface ModelRef {
   readonly provider: string;
@@ -58,11 +62,24 @@ export interface SessionSummary {
   readonly messageCount: number;
 }
 
+export interface SessionListQuery {
+  readonly parentSessionId?: string;
+  readonly status?: SessionStatus;
+  readonly limit?: number;
+  readonly cursor?: string;
+}
+
+export interface SessionListPage {
+  readonly items: SessionSummary[];
+  readonly nextCursor?: string;
+}
+
 export interface SessionStore {
   load(sessionId: string): Promise<SessionSnapshot | null>;
   save(sessionId: string, snapshot: SessionSnapshot): Promise<void>;
   delete(sessionId: string): Promise<boolean>;
-  list(): Promise<SessionSummary[]>;
+  list(query?: SessionListQuery): Promise<SessionListPage>;
+  close?(): Promise<void>;
 }
 
 /** Build a `SessionSummary` from a full `SessionSnapshot`. */
@@ -82,7 +99,7 @@ export function summarizeSnapshot(snapshot: SessionSnapshot): SessionSummary {
 /** Sort summaries newest-updated first, breaking ties deterministically by `sessionId`. */
 export function sortSessionSummaries(summaries: SessionSummary[]): SessionSummary[] {
   return summaries.sort(
-    (a, b) => b.updatedAt - a.updatedAt || a.sessionId.localeCompare(b.sessionId),
+    (a, b) => b.updatedAt - a.updatedAt || (a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 : 0),
   );
 }
 
@@ -146,7 +163,7 @@ export interface ForkSessionOptions {
 }
 
 export interface BaseSessionOptions {
-  readonly models: Models;
+  readonly models: ModelsProvider;
   readonly store: SessionStore;
   readonly systemPrompt?: string;
   readonly tools?: readonly AgentTool<any>[];
@@ -157,6 +174,8 @@ export interface BaseSessionOptions {
   readonly thinkingLevel?: ThinkingLevel;
   readonly thinkingBudgets?: ThinkingBudgets;
   readonly toolExecution?: ToolExecutionMode;
+  readonly steeringMode?: QueueMode;
+  readonly followUpMode?: QueueMode;
   /** Request attribution identity; defaults to `{ attribution: null }`. */
   readonly identity?: ClientIdentity;
   /** Optional upper bound on tool-calling turns within a single run. */
@@ -185,6 +204,7 @@ export type HarnessErrorCode =
   | "SESSION_NOT_FOUND"
   | "SESSION_EXISTS"
   | "SESSION_BUSY"
+  | "SESSION_IDLE"
   | "SESSION_INVALIDATED"
   | "UNSUPPORTED_SNAPSHOT_VERSION"
   | "NOTHING_TO_CONTINUE";

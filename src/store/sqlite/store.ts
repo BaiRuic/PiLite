@@ -1,5 +1,12 @@
-import type { SessionSnapshot, SessionStore, SessionSummary } from "../../types.js";
-import type { SqliteDatabase } from "./database.js";
+import type {
+  SessionListPage,
+  SessionListQuery,
+  SessionSnapshot,
+  SessionStore,
+  SessionSummary,
+} from "../../types.js";
+import { decodeSessionCursor, encodeSessionCursor, validateSessionListQuery } from "../query.js";
+import type { SqliteDatabase, SqliteValue } from "./database.js";
 import { applySqliteMigrations, createSqliteSessionSchema, type SqliteSessionSchema } from "./schema.js";
 
 export interface SqliteSessionStoreOptions {
@@ -127,14 +134,42 @@ export class SqliteSessionStore implements SessionStore {
     return changes > 0;
   }
 
-  async list(): Promise<SessionSummary[]> {
+  async list(query: SessionListQuery = {}): Promise<SessionListPage> {
     this.assertOpen();
+    validateSessionListQuery(query);
+    const decodedCursor = query.cursor !== undefined ? decodeSessionCursor(query.cursor) : undefined;
+
+    const clauses: string[] = [];
+    const params: SqliteValue[] = [];
+    if (query.parentSessionId !== undefined) {
+      clauses.push("parent_session_id = ?");
+      params.push(query.parentSessionId);
+    }
+    if (query.status !== undefined) {
+      clauses.push("status = ?");
+      params.push(query.status);
+    }
+    if (decodedCursor !== undefined) {
+      clauses.push("(updated_at < ? OR (updated_at = ? AND session_id > ?))");
+      params.push(decodedCursor.updatedAt, decodedCursor.updatedAt, decodedCursor.sessionId);
+    }
+
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+    const limitClause = query.limit !== undefined ? "LIMIT ?" : "";
+    if (query.limit !== undefined) {
+      params.push(query.limit + 1);
+    }
+
     const rows = await this.db.all<SummaryRow>(
       `SELECT session_id, provider, model_id, status, title, parent_session_id, created_at, updated_at, message_count
        FROM ${this.schema.tables.sessions}
-       ORDER BY updated_at DESC, session_id ASC`,
+       ${where}
+       ORDER BY updated_at DESC, session_id ASC
+       ${limitClause}`,
+      ...params,
     );
-    return rows.map((row) => ({
+
+    const summaries: SessionSummary[] = rows.map((row) => ({
       sessionId: row.session_id,
       model: { provider: row.provider, modelId: row.model_id },
       status: row.status,
@@ -144,6 +179,15 @@ export class SqliteSessionStore implements SessionStore {
       updatedAt: row.updated_at,
       messageCount: row.message_count,
     }));
+
+    if (query.limit === undefined || summaries.length <= query.limit) {
+      return { items: summaries };
+    }
+    const items = summaries.slice(0, query.limit);
+    return {
+      items,
+      nextCursor: encodeSessionCursor(items[items.length - 1]!),
+    };
   }
 
   close(): Promise<void> {

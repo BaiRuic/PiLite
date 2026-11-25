@@ -1,12 +1,13 @@
 /// <reference lib="dom" />
 
 import {
-  sortSessionSummaries,
   summarizeSnapshot,
+  type SessionListPage,
+  type SessionListQuery,
   type SessionSnapshot,
   type SessionStore,
-  type SessionSummary,
 } from "../types.js";
+import { filterAndPaginateSummaries, validateSessionListQuery } from "./query.js";
 
 const DATABASE_VERSION = 1;
 const DEFAULT_STORE_NAME = "harness_sessions";
@@ -157,14 +158,18 @@ export class IndexedDbSessionStore implements SessionStore {
     return existing !== undefined;
   }
 
-  async list(): Promise<SessionSummary[]> {
+  async list(query?: SessionListQuery): Promise<SessionListPage> {
     this.assertOpen();
+    validateSessionListQuery(query);
     const tx = this.db.transaction(this.storeName, "readonly");
     const store = tx.objectStore(this.storeName);
     const done = transactionResult(tx);
     const records = (await requestResult(store.getAll())) as IndexedDbSessionRecord[];
     await done;
-    return sortSessionSummaries(records.map((record) => summarizeSnapshot(record.snapshot)));
+    return filterAndPaginateSummaries(
+      records.map((record) => summarizeSnapshot(record.snapshot)),
+      query,
+    );
   }
 
   async close(): Promise<void> {

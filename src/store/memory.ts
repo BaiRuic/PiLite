@@ -1,10 +1,11 @@
 import {
-  sortSessionSummaries,
   summarizeSnapshot,
+  type SessionListPage,
+  type SessionListQuery,
   type SessionSnapshot,
   type SessionStore,
-  type SessionSummary,
 } from "../types.js";
+import { filterAndPaginateSummaries } from "./query.js";
 
 /**
  * In-memory `SessionStore` for unit tests and ephemeral sessions.
@@ -26,9 +27,9 @@ export class InMemorySessionStore implements SessionStore {
     return this.snapshots.delete(sessionId);
   }
 
-  async list(): Promise<SessionSummary[]> {
+  async list(query?: SessionListQuery): Promise<SessionListPage> {
     const summaries = [...this.snapshots.values()].map(summarizeSnapshot);
-    return sortSessionSummaries(summaries);
+    return filterAndPaginateSummaries(summaries, query);
   }
 
   has(sessionId: string): boolean {

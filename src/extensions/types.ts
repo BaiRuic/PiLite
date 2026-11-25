@@ -1,6 +1,7 @@
 import type {
   AgentEvent,
   AgentMessage,
+  AgentToolCallOutcome,
   AgentToolResult,
   AgentToolUpdateCallback,
   ToolExecutionMode,
@@ -51,6 +52,11 @@ export interface ExtensionEventBus {
   emit(channel: string, data: unknown): void;
 }
 
+export interface ExecuteToolOptions {
+  readonly signal?: AbortSignal;
+  readonly onUpdate?: AgentToolUpdateCallback<any>;
+}
+
 export interface ExtensionContext {
   readonly sessionId: string;
   readonly model: Model<Api>;
@@ -62,6 +68,15 @@ export interface ExtensionContext {
   isIdle(): boolean;
   getSignal(): AbortSignal | undefined;
   abort(): void;
+  /**
+   * Execute another registered tool through the same validation and
+   * `tool_call` / `tool_result` extension hook pipeline as model-issued calls.
+   */
+  executeTool(
+    name: string,
+    args: Record<string, unknown>,
+    options?: ExecuteToolOptions,
+  ): Promise<AgentToolCallOutcome>;
 }
 
 export interface ExtensionToolDefinition<
@@ -139,6 +154,8 @@ export interface ToolCallExtensionEvent {
   readonly toolCallId: string;
   readonly toolName: string;
   readonly input: Record<string, unknown>;
+  /** Set when invoked via `ctx.executeTool()` from inside a running tool. */
+  readonly parentToolCallId?: string;
 }
 
 export interface ToolCallExtensionResult {
@@ -155,6 +172,8 @@ export interface ToolResultExtensionEvent {
   readonly content: (TextContent | ImageContent)[];
   readonly details: unknown;
   readonly isError: boolean;
+  /** Set when invoked via `ctx.executeTool()` from inside a running tool. */
+  readonly parentToolCallId?: string;
 }
 
 export interface ToolResultExtensionResult {

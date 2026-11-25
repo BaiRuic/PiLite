@@ -113,7 +113,7 @@ describe("HarnessSession management features (fork, setModel, thinking, title, r
     expect(earlyFork.getSnapshot().messages.map((m) => m.role)).toEqual(["system", "user"]);
 
     const listed = await store.list();
-    expect(listed.map((s) => s.sessionId).sort()).toEqual(["fork-1", "fork-early", "root-1"]);
+    expect(listed.items.map((s) => s.sessionId).sort()).toEqual(["fork-1", "fork-early", "root-1"]);
   });
 
   it("switches model, thinking level, and title while idle and restores them on reopen", async () => {

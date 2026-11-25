@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import {
   Agent,
+  runToolCall,
   type AgentEvent,
   type AgentMessage,
+  type AgentToolCall,
   type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import {
@@ -15,6 +17,7 @@ import {
   type AssistantMessage,
   type ClientIdentity,
   type ImageContent,
+  type JsonObject,
   type Model,
   type Models,
   type SystemMessage,
@@ -39,6 +42,7 @@ import {
   type CustomSessionEntry,
   type ForkSessionOptions,
   type ModelRef,
+  type ModelsProvider,
   type OpenSessionOptions,
   type RetryOptions,
   type SessionEventListener,
@@ -111,6 +115,10 @@ function validateCompactionOptions(compaction: CompactionOptions | undefined): v
       `compaction.keepRecentTokens must be a non-negative integer, got: ${String(compaction.keepRecentTokens)}`,
     );
   }
+}
+
+function resolveModels(source: ModelsProvider): Models {
+  return typeof source === "function" ? source() : source;
 }
 
 function resolveModelOrThrow(models: Models, ref: ModelRef): Model<Api> {
@@ -222,7 +230,7 @@ function defaultSleepWithAbort(ms: number, signal: AbortSignal): Promise<void> {
 export class HarnessSession {
   readonly sessionId: string;
 
-  private readonly models: Models;
+  private readonly modelsSource: ModelsProvider;
   private readonly store: SessionStore;
   private readonly agent: Agent;
   private readonly extensions: ExtensionRunner;
@@ -253,7 +261,7 @@ export class HarnessSession {
   }) {
     const { snapshot, model, thinkingLevel, extensions, options } = params;
     this.sessionId = snapshot.sessionId;
-    this.models = options.models;
+    this.modelsSource = options.models;
     this.store = options.store;
     this.extensions = extensions;
     this.baseOptions = options;
@@ -274,11 +282,17 @@ export class HarnessSession {
         tools: extensions.getActiveAgentTools(),
         messages: structuredClone(snapshot.messages),
       },
-      streamFn: options.models.streamSimple.bind(options.models),
+      streamFn: (reqModel, context, streamOptions) => {
+        const currentModels = this.getModels();
+        const freshModel = currentModels.getModel(reqModel.provider, reqModel.id) ?? reqModel;
+        return currentModels.streamSimple(freshModel, context, streamOptions);
+      },
       sessionId: snapshot.sessionId,
       identity: this.identity,
       thinkingBudgets: options.thinkingBudgets,
       toolExecution: options.toolExecution,
+      ...(options.steeringMode !== undefined ? { steeringMode: options.steeringMode } : {}),
+      ...(options.followUpMode !== undefined ? { followUpMode: options.followUpMode } : {}),
       transformContext: async (messages) => {
         const transformed = await this.extensions.emitContext(messages);
         const forced = this.activeRunSystemPromptOverride;
@@ -362,6 +376,69 @@ export class HarnessSession {
       abort: () => {
         void this.abort();
       },
+      executeTool: async (name, args, execOptions, parentToolCallId) => {
+        const toolCall: AgentToolCall = {
+          type: "toolCall",
+          id: randomUUID(),
+          name,
+          arguments: args as JsonObject,
+        };
+        const currentModel = this.agent.state.model;
+        const assistantMessage =
+          findLastAssistantMessage(this.agent.state.messages) ??
+          ({
+            role: "assistant",
+            content: [toolCall],
+            api: currentModel.api,
+            provider: currentModel.provider,
+            model: currentModel.id,
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: "toolUse",
+            timestamp: this.now(),
+          } satisfies AssistantMessage);
+
+        const allTools = this.extensions.getAllAgentTools();
+        return runToolCall(toolCall, {
+          tools: allTools,
+          assistantMessage,
+          context: {
+            messages: this.agent.state.messages,
+            tools: allTools,
+          },
+          signal: execOptions?.signal ?? this.agent.signal,
+          onUpdate: execOptions?.onUpdate,
+          beforeToolCall: async ({ toolCall: tc, args: validatedArgs }) =>
+            this.extensions.emitToolCall({
+              type: "tool_call",
+              toolCallId: tc.id,
+              toolName: tc.name,
+              input: (validatedArgs && typeof validatedArgs === "object"
+                ? validatedArgs
+                : {}) as Record<string, unknown>,
+              ...(parentToolCallId !== undefined ? { parentToolCallId } : {}),
+            }),
+          afterToolCall: async ({ toolCall: tc, args: validatedArgs, result, isError }) =>
+            this.extensions.emitToolResult({
+              type: "tool_result",
+              toolCallId: tc.id,
+              toolName: tc.name,
+              input: (validatedArgs && typeof validatedArgs === "object"
+                ? validatedArgs
+                : {}) as Record<string, unknown>,
+              content: result.content,
+              details: result.details,
+              isError,
+              ...(parentToolCallId !== undefined ? { parentToolCallId } : {}),
+            }),
+        });
+      },
       onActiveToolsChanged: (tools) => {
         this.agent.state.tools = tools;
       },
@@ -383,7 +460,7 @@ export class HarnessSession {
     validateMaxTurns(options.maxTurns);
     validateRetryOptions(options.retry);
     validateCompactionOptions(options.compaction);
-    const resolvedModel = resolveModelOrThrow(options.models, options.model);
+    const resolvedModel = resolveModelOrThrow(resolveModels(options.models), options.model);
     const now = options.now ?? (() => Date.now());
     const sessionId = options.sessionId ?? options.generateId?.() ?? randomUUID();
 
@@ -451,7 +528,7 @@ export class HarnessSession {
       );
     }
 
-    const resolvedModel = resolveModelOrThrow(options.models, loaded.model);
+    const resolvedModel = resolveModelOrThrow(resolveModels(options.models), loaded.model);
     const thinkingLevel = options.thinkingLevel ?? loaded.thinkingLevel ?? "off";
 
     const extensions = await ExtensionRunner.load({
@@ -603,7 +680,7 @@ export class HarnessSession {
   /** Switch the session's model while idle and persist the updated `ModelRef`. */
   async setModel(modelRef: ModelRef): Promise<void> {
     this.assertReadyForRun();
-    const resolved = resolveModelOrThrow(this.models, modelRef);
+    const resolved = resolveModelOrThrow(this.getModels(), modelRef);
     const updated = this.buildSnapshot({
       model: { provider: modelRef.provider, modelId: modelRef.modelId },
       messages: this.committedSnapshot.messages,
@@ -707,7 +784,7 @@ export class HarnessSession {
       throw new HarnessError("SESSION_EXISTS", `Session "${newSessionId}" already exists.`);
     }
 
-    const resolvedModel = resolveModelOrThrow(this.models, this.committedSnapshot.model);
+    const resolvedModel = resolveModelOrThrow(this.getModels(), this.committedSnapshot.model);
     const forkedExtensions = await ExtensionRunner.load({
       extensions: this.baseOptions.extensions ?? [],
       baseTools: this.baseOptions.tools ?? [],
@@ -758,6 +835,7 @@ export class HarnessSession {
    */
   async compact(options: CompactionRequestOptions = {}): Promise<CompactionResult> {
     this.assertReadyForRun();
+    this.agent.state.model = resolveModelOrThrow(this.getModels(), this.committedSnapshot.model);
     const keepRecentTokens =
       options.keepRecentTokens ??
       this.compaction?.keepRecentTokens ??
@@ -808,6 +886,38 @@ export class HarnessSession {
     };
   }
 
+  /** Queue a steering message to guide an active run after the current tool round. */
+  steer(input: string, images?: ImageContent[]): void;
+  steer(message: AgentMessage): void;
+  steer(input: string | AgentMessage, images?: ImageContent[]): void {
+    this.assertActiveForQueue("steer");
+    const [message] = normalizePromptInput(input, images, this.now);
+    if (message) {
+      this.agent.steer(message);
+    }
+  }
+
+  /** Queue a follow-up message to execute after the active run would otherwise finish. */
+  followUp(input: string, images?: ImageContent[]): void;
+  followUp(message: AgentMessage): void;
+  followUp(input: string | AgentMessage, images?: ImageContent[]): void {
+    this.assertActiveForQueue("followUp");
+    const [message] = normalizePromptInput(input, images, this.now);
+    if (message) {
+      this.agent.followUp(message);
+    }
+  }
+
+  /** Discard any queued steering and follow-up messages. */
+  clearQueues(): void {
+    this.agent.clearAllQueues();
+  }
+
+  /** Whether any steering or follow-up messages are currently queued. */
+  hasQueuedMessages(): boolean {
+    return this.agent.hasQueuedMessages();
+  }
+
   /**
    * Abort the active run (including any retry backoff wait) and wait until both
    * `pi-agent-core` and final snapshot persistence have settled.
@@ -819,6 +929,7 @@ export class HarnessSession {
     }
     current.abortRequested = true;
     current.abortController.abort();
+    this.agent.clearAllQueues();
     this.agent.abort();
     await current.promise.catch(() => undefined);
   }
@@ -944,7 +1055,7 @@ export class HarnessSession {
           signal,
         })
       : await defaultSummarizeMessages({
-          models: this.models,
+          models: this.getModels(),
           model: this.agent.state.model,
           messages: plan.toSummarize,
           instructions,
@@ -993,6 +1104,10 @@ export class HarnessSession {
     }
   }
 
+  private getModels(): Models {
+    return resolveModels(this.modelsSource);
+  }
+
   private assertReadyForRun(): void {
     if (this.invalidated) {
       throw new HarnessError(
@@ -1002,6 +1117,21 @@ export class HarnessSession {
     }
     if (this.activeRun) {
       throw new HarnessError("SESSION_BUSY", `Session "${this.sessionId}" already has an active run.`);
+    }
+  }
+
+  private assertActiveForQueue(method: "steer" | "followUp"): void {
+    if (this.invalidated) {
+      throw new HarnessError(
+        "SESSION_INVALIDATED",
+        `Session "${this.sessionId}" was invalidated after a persistence failure. Reopen it before running again.`,
+      );
+    }
+    if (!this.activeRun) {
+      throw new HarnessError(
+        "SESSION_IDLE",
+        `Cannot call ${method}() while session "${this.sessionId}" is idle. Use prompt() instead.`,
+      );
     }
   }
 
@@ -1021,6 +1151,7 @@ export class HarnessSession {
       try {
         return await this.executeRun(plan, runHandle);
       } finally {
+        this.agent.clearAllQueues();
         this.activeRunSystemPromptOverride = undefined;
         if (this.activeRun === runHandle) {
           this.activeRun = undefined;
@@ -1042,6 +1173,7 @@ export class HarnessSession {
       | { kind: "continue"; promptText: string; preRunMessages: AgentMessage[] },
     runHandle: ActiveRun,
   ): Promise<SessionRunResult> {
+    this.agent.state.model = resolveModelOrThrow(this.getModels(), this.committedSnapshot.model);
     const beforeCustomEntries = structuredClone(this.customEntries);
     const beforeMessages = structuredClone(this.agent.state.messages);
 
