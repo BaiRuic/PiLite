@@ -13,6 +13,7 @@ import type {
   ExtensionExecFn,
   ExtensionRegistration,
   ExtensionUIAdapter,
+  PromptSection,
 } from "./extensions/types.js";
 
 export const SESSION_SNAPSHOT_VERSION = 1 as const;
@@ -181,6 +182,8 @@ export interface BaseSessionOptions {
   readonly models: ModelsProvider;
   readonly store: SessionStore;
   readonly systemPrompt?: string;
+  /** Optional dynamic named system prompt sections (aligned with `pi-durable`'s `PromptSection`). */
+  readonly promptSections?: readonly PromptSection[];
   readonly tools?: readonly AgentTool<any>[];
   readonly extensions?: readonly ExtensionRegistration[];
   readonly ui?: ExtensionUIAdapter;

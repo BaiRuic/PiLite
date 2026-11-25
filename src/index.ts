@@ -32,6 +32,7 @@ export {
   type ContextUsage,
   createDefaultCompactionExtension,
   type DefaultCompactionExtensionOptions,
+  definePromptSection,
   defineTool,
   type ExecuteToolOptions,
   type ExtensionAPI,
@@ -60,6 +61,8 @@ export {
   type InputSource,
   type ModelSelectEvent,
   type ModelSelectSource,
+  type PromptSection,
+  type PromptSectionWrapper,
   type SendUserMessageOptions,
   type SessionBeforeCompactEvent,
   type SessionBeforeCompactResult,
@@ -82,6 +85,12 @@ export {
   filterAndPaginateSummaries,
   validateSessionListQuery,
 } from "./store/query.js";
+export {
+  planSections,
+  renderSections,
+  replaySections,
+  SYSTEM_PROMPT_SECTION,
+} from "./system-prompt.js";
 export {
   type BaseSessionOptions,
   type CreateSessionOptions,

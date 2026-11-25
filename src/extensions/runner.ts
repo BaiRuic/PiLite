@@ -8,6 +8,7 @@ import type {
   ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import type { Api, ImageContent, Model, Models, ProviderHeaders, TextContent } from "@earendil-works/pi-ai";
+import { planSections, renderSections, replaySections, SYSTEM_PROMPT_SECTION } from "../system-prompt.js";
 import type { CustomSessionEntry, ModelRef, SessionSnapshot } from "../types.js";
 import { BUILTIN_COMPACTION_EXTENSION_NAME } from "./default-compaction.js";
 import type {
@@ -34,6 +35,8 @@ import type {
   InputEventResult,
   InputSource,
   ModelSelectEvent,
+  PromptSection,
+  PromptSectionWrapper,
   SendUserMessageOptions,
   SessionBeforeCompactEvent,
   SessionBeforeCompactResult,
@@ -182,6 +185,16 @@ function createEventBus(
 export class ExtensionRunner {
   private readonly handlers = new Map<string, RegisteredHandler[]>();
   private readonly tools = new Map<string, AgentTool<any>>();
+  private readonly basePromptSections: readonly PromptSection[];
+  private readonly extensionPromptSections: Array<{
+    readonly extensionName: string;
+    readonly section: PromptSection;
+  }> = [];
+  private readonly promptSectionWrappers: Array<{
+    readonly extensionName: string;
+    readonly key: string;
+    readonly wrap: PromptSectionWrapper;
+  }> = [];
   private activeToolNames: string[] = [];
   private readonly events: ExtensionEventBus;
   private bindings: ExtensionHostBindings | undefined;
@@ -189,8 +202,10 @@ export class ExtensionRunner {
 
   private constructor(
     baseTools: readonly AgentTool<any>[],
+    basePromptSections: readonly PromptSection[],
     onDiagnostic?: (diagnostic: ExtensionDiagnostic) => void,
   ) {
+    this.basePromptSections = basePromptSections.slice();
     this.onDiagnostic = onDiagnostic;
     this.events = createEventBus(onDiagnostic);
     for (const tool of baseTools) {
@@ -204,9 +219,14 @@ export class ExtensionRunner {
   static async load(params: {
     readonly extensions: readonly ExtensionRegistration[];
     readonly baseTools: readonly AgentTool<any>[];
+    readonly basePromptSections?: readonly PromptSection[];
     readonly onDiagnostic?: (diagnostic: ExtensionDiagnostic) => void;
   }): Promise<ExtensionRunner> {
-    const runner = new ExtensionRunner(params.baseTools, params.onDiagnostic);
+    const runner = new ExtensionRunner(
+      params.baseTools,
+      params.basePromptSections ?? [],
+      params.onDiagnostic,
+    );
 
     for (let index = 0; index < params.extensions.length; index += 1) {
       const entry = params.extensions[index]!;
@@ -266,6 +286,87 @@ export class ExtensionRunner {
 
   hasHandlers(event: ExtensionEventName): boolean {
     return (this.handlers.get(event)?.length ?? 0) > 0;
+  }
+
+  hasPromptSections(): boolean {
+    return (
+      this.basePromptSections.length > 0 ||
+      this.extensionPromptSections.length > 0 ||
+      this.promptSectionWrappers.length > 0
+    );
+  }
+
+  /**
+   * Resolve, render, and diff all prompt sections against `messages` (aligned with `pi-durable`).
+   * Preserves an existing persisted `"system"` section when `desiredSystemPrompt` is `undefined`
+   * (e.g. `openSession()` / `fork()` without an explicit `systemPrompt` override).
+   */
+  async planPromptSectionPatches(
+    messages: readonly AgentMessage[],
+    desiredSystemPrompt: string | undefined,
+  ): Promise<Record<string, string | null>[]> {
+    const shown = replaySections(messages);
+
+    const resolved = new Map<string, { section: PromptSection; ownerName: string }>();
+    if (desiredSystemPrompt !== undefined) {
+      resolved.set(SYSTEM_PROMPT_SECTION, {
+        ownerName: "host",
+        section: {
+          key: SYSTEM_PROMPT_SECTION,
+          tag: false,
+          render: () => (desiredSystemPrompt.length > 0 ? desiredSystemPrompt : undefined),
+        },
+      });
+    } else if (shown.has(SYSTEM_PROMPT_SECTION)) {
+      const existingSystem = shown.get(SYSTEM_PROMPT_SECTION)!;
+      resolved.set(SYSTEM_PROMPT_SECTION, {
+        ownerName: "host",
+        section: {
+          key: SYSTEM_PROMPT_SECTION,
+          tag: false,
+          render: () => existingSystem,
+        },
+      });
+    }
+
+    for (const section of this.basePromptSections) {
+      resolved.set(section.key, { section, ownerName: "host" });
+    }
+    for (const entry of this.extensionPromptSections) {
+      resolved.set(entry.section.key, { section: entry.section, ownerName: entry.extensionName });
+    }
+
+    // Apply wrappers in registration order; a wrapper that throws or renames drops its target and reports.
+    for (const wrapper of this.promptSectionWrappers) {
+      const current = resolved.get(wrapper.key);
+      if (!current) continue;
+      try {
+        const next = wrapper.wrap(current.section);
+        if (next.key !== current.section.key) {
+          throw new Error(
+            `Prompt section wrapper for "${current.section.key}" must not rename key to "${next.key}".`,
+          );
+        }
+        resolved.set(wrapper.key, { section: next, ownerName: wrapper.extensionName });
+      } catch (error) {
+        resolved.delete(wrapper.key);
+        this.reportHandlerError(wrapper.extensionName, "prompt_section", error);
+      }
+    }
+
+    const ordered = [...resolved.values()];
+    const ownersByKey = new Map(ordered.map((item) => [item.section.key, item.ownerName]));
+    const ctx = this.createContext();
+    const desired = await renderSections(
+      ordered.map((item) => item.section),
+      ctx,
+      shown,
+      (error, section) => {
+        this.reportHandlerError(ownersByKey.get(section.key) ?? "host", "prompt_section", error);
+      },
+    );
+
+    return planSections(shown, desired);
   }
 
   async emitSessionStart(reason: "create" | "open" | "fork"): Promise<void> {
@@ -675,6 +776,12 @@ export class ExtensionRunner {
           this.activeToolNames.push(definition.name);
         }
         this.bindings?.onActiveToolsChanged(this.getActiveAgentTools());
+      },
+      registerPromptSection: (section: PromptSection) => {
+        this.extensionPromptSections.push({ extensionName, section });
+      },
+      wrapPromptSection: (key: string, wrap: PromptSectionWrapper) => {
+        this.promptSectionWrappers.push({ extensionName, key, wrap });
       },
       getActiveTools: () => this.getActiveToolNames(),
       setActiveTools: (toolNames: string[]) => this.setActiveToolNames(toolNames),

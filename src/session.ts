@@ -12,6 +12,7 @@ import {
   type ClientIdentity,
   contentText,
   getCurrentSystemMessage,
+  getCurrentSystemPrompt,
   getSupportedThinkingLevels,
   type ImageContent,
   isContextOverflow,
@@ -43,7 +44,11 @@ import {
 } from "./extensions/default-compaction.js";
 import { ExtensionRunner } from "./extensions/runner.js";
 import type { InputSource, SendUserMessageOptions } from "./extensions/types.js";
-import { buildSystemPromptPatch, createInitialTranscript } from "./system-prompt.js";
+import {
+  buildSectionPatchMessages,
+  buildSystemPromptPatch,
+  createInitialTranscript,
+} from "./system-prompt.js";
 import {
   type BaseSessionOptions,
   type CreateSessionOptions,
@@ -196,6 +201,7 @@ function loadSessionExtensions(
   return ExtensionRunner.load({
     extensions: [...(options.extensions ?? []), builtinCompaction],
     baseTools: options.tools ?? [],
+    basePromptSections: options.promptSections ?? [],
     onDiagnostic: options.onExtensionDiagnostic,
   });
 }
@@ -316,8 +322,11 @@ function stripTrailingFailedAssistants(messages: readonly AgentMessage[]): Agent
 
 function insertBeforeTrailingNonSystem(
   messages: readonly AgentMessage[],
-  patch: AgentMessage,
+  patches: readonly AgentMessage[],
 ): AgentMessage[] {
+  if (patches.length === 0) {
+    return messages.slice();
+  }
   let insertIndex = messages.length;
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i]?.role !== "system") {
@@ -325,7 +334,7 @@ function insertBeforeTrailingNonSystem(
       break;
     }
   }
-  return [...messages.slice(0, insertIndex), patch, ...messages.slice(insertIndex)];
+  return [...messages.slice(0, insertIndex), ...patches, ...messages.slice(insertIndex)];
 }
 
 function defaultSleepWithAbort(ms: number, signal: AbortSignal): Promise<void> {
@@ -467,6 +476,13 @@ export class HarnessSession {
       onPayload: async (payload, reqModel) => this.extensions.emitBeforeProviderRequest(payload, reqModel),
       onResponse: async (response, reqModel) => {
         await this.extensions.emitAfterProviderResponse(response, reqModel);
+      },
+      prepareNextTurnWithContext: async ({ context }) => {
+        if (!this.extensions.hasPromptSections()) {
+          return undefined;
+        }
+        const patches = await this.planPromptSectionMessages(context.messages);
+        return patches.length > 0 ? { messages: patches } : undefined;
       },
       finishTurn: ({ message, toolResults }) => {
         if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -1292,23 +1308,13 @@ export class HarnessSession {
     }
 
     const userMessages = normalizePromptInput(effectiveInput, effectiveImages, this.now);
-    const systemPatch = buildSystemPromptPatch(this.agent.state.messages, this.desiredSystemPrompt, this.now);
-    const pendingMessages: AgentMessage[] = systemPatch ? [systemPatch, ...userMessages] : userMessages;
     const promptImages = extractPromptImages(userMessages);
 
     return this.startRun({
       kind: "prompt",
       promptText: extractPromptText(userMessages),
       ...(promptImages !== undefined ? { promptImages } : {}),
-      pendingMessages,
-      preRunFullMessages: [
-        ...structuredClone(this.committedSnapshot.messages),
-        ...structuredClone(pendingMessages),
-      ],
-      preRunContextMessages: [
-        ...structuredClone(this.agent.state.messages),
-        ...structuredClone(pendingMessages),
-      ],
+      userMessages,
     });
   }
 
@@ -1409,20 +1415,14 @@ export class HarnessSession {
       throw new HarnessError("NOTHING_TO_CONTINUE", "Cannot continue from a completed assistant message.");
     }
 
-    const systemPatch = buildSystemPromptPatch(candidateContextMessages, this.desiredSystemPrompt, this.now);
-    const preRunFullMessages = systemPatch
-      ? insertBeforeTrailingNonSystem(candidateFullMessages, systemPatch)
-      : candidateFullMessages;
-    const preRunContextMessages = projectContextMessages(preRunFullMessages, clampedCompactions);
-
     const promptImages = extractPromptImages(candidateContextMessages.slice(-1));
 
     return this.startRun({
       kind: "continue",
       promptText: extractPromptText(candidateContextMessages.slice(-1)),
       ...(promptImages !== undefined ? { promptImages } : {}),
-      preRunFullMessages: structuredClone(preRunFullMessages),
-      preRunContextMessages: structuredClone(preRunContextMessages),
+      candidateFullMessages: structuredClone(candidateFullMessages),
+      candidateContextMessages: structuredClone(candidateContextMessages),
       compactions: clampedCompactions,
     });
   }
@@ -1761,22 +1761,25 @@ export class HarnessSession {
     }
   }
 
+  private async planPromptSectionMessages(messages: readonly AgentMessage[]): Promise<SystemMessage[]> {
+    const patches = await this.extensions.planPromptSectionPatches(messages, this.desiredSystemPrompt);
+    return buildSectionPatchMessages(messages, patches, this.now);
+  }
+
   private startRun(
     plan:
       | {
           kind: "prompt";
           promptText: string;
           promptImages?: ImageContent[];
-          pendingMessages: AgentMessage[];
-          preRunFullMessages: AgentMessage[];
-          preRunContextMessages: AgentMessage[];
+          userMessages: AgentMessage[];
         }
       | {
           kind: "continue";
           promptText: string;
           promptImages?: ImageContent[];
-          preRunFullMessages: AgentMessage[];
-          preRunContextMessages: AgentMessage[];
+          candidateFullMessages: AgentMessage[];
+          candidateContextMessages: AgentMessage[];
           compactions: CompactionCheckpoint[];
         },
   ): Promise<SessionRunResult> {
@@ -1846,16 +1849,14 @@ export class HarnessSession {
           kind: "prompt";
           promptText: string;
           promptImages?: ImageContent[];
-          pendingMessages: AgentMessage[];
-          preRunFullMessages: AgentMessage[];
-          preRunContextMessages: AgentMessage[];
+          userMessages: AgentMessage[];
         }
       | {
           kind: "continue";
           promptText: string;
           promptImages?: ImageContent[];
-          preRunFullMessages: AgentMessage[];
-          preRunContextMessages: AgentMessage[];
+          candidateFullMessages: AgentMessage[];
+          candidateContextMessages: AgentMessage[];
           compactions: CompactionCheckpoint[];
         },
     runHandle: ActiveRun,
@@ -1869,18 +1870,80 @@ export class HarnessSession {
       this.compactionCheckpoints = structuredClone(plan.compactions);
     }
 
+    const baseContextMessages =
+      plan.kind === "prompt" ? this.agent.state.messages : plan.candidateContextMessages;
+    let sectionPatches: SystemMessage[];
+    try {
+      sectionPatches = await this.planPromptSectionMessages(baseContextMessages);
+    } catch (error) {
+      this.agent.state.messages = beforeAgentMessages;
+      this.compactionCheckpoints = beforeCompactions;
+      this.customEntries = beforeCustomEntries;
+      throw error;
+    }
+
+    const activePlan:
+      | {
+          kind: "prompt";
+          promptText: string;
+          promptImages?: ImageContent[];
+          pendingMessages: AgentMessage[];
+          preRunFullMessages: AgentMessage[];
+          preRunContextMessages: AgentMessage[];
+        }
+      | {
+          kind: "continue";
+          promptText: string;
+          promptImages?: ImageContent[];
+          preRunFullMessages: AgentMessage[];
+          preRunContextMessages: AgentMessage[];
+          compactions: CompactionCheckpoint[];
+        } =
+      plan.kind === "prompt"
+        ? (() => {
+            const pendingMessages: AgentMessage[] = [...sectionPatches, ...plan.userMessages];
+            return {
+              kind: "prompt" as const,
+              promptText: plan.promptText,
+              ...(plan.promptImages !== undefined ? { promptImages: plan.promptImages } : {}),
+              pendingMessages,
+              preRunFullMessages: [
+                ...structuredClone(this.committedSnapshot.messages),
+                ...structuredClone(pendingMessages),
+              ],
+              preRunContextMessages: [
+                ...structuredClone(this.agent.state.messages),
+                ...structuredClone(pendingMessages),
+              ],
+            };
+          })()
+        : (() => {
+            const preRunFullMessages = insertBeforeTrailingNonSystem(
+              plan.candidateFullMessages,
+              sectionPatches,
+            );
+            return {
+              kind: "continue" as const,
+              promptText: plan.promptText,
+              ...(plan.promptImages !== undefined ? { promptImages: plan.promptImages } : {}),
+              preRunFullMessages: structuredClone(preRunFullMessages),
+              preRunContextMessages: projectContextMessages(preRunFullMessages, this.compactionCheckpoints),
+              compactions: plan.compactions,
+            };
+          })();
+
     // Optional threshold auto-compaction before starting the run.
-    let activePlan = plan;
+    let currentPlan = activePlan;
     if (this.compaction?.enabled === true) {
       const contextWindow = this.effectiveContextWindow();
       const reserveTokens = this.compaction.reserveTokens ?? DEFAULT_COMPACTION_RESERVE_TOKENS;
       const keepRecentTokens = this.compaction.keepRecentTokens ?? DEFAULT_COMPACTION_KEEP_RECENT_TOKENS;
       if (
         contextWindow > 0 &&
-        estimateTranscriptTokens(activePlan.preRunContextMessages) > contextWindow - reserveTokens
+        estimateTranscriptTokens(currentPlan.preRunContextMessages) > contextWindow - reserveTokens
       ) {
         const compactionSourceMessages =
-          activePlan.kind === "prompt" ? this.committedSnapshot.messages : activePlan.preRunFullMessages;
+          currentPlan.kind === "prompt" ? this.committedSnapshot.messages : currentPlan.preRunFullMessages;
         const compacted = await this.runCompactionCheckpoint({
           fullMessages: compactionSourceMessages,
           compactions: this.compactionCheckpoints,
@@ -1893,10 +1956,10 @@ export class HarnessSession {
         if (compacted.compacted) {
           this.compactionCheckpoints = [...this.compactionCheckpoints, compacted.checkpoint];
           this.agent.state.messages = structuredClone(compacted.nextContextMessages);
-          activePlan = {
-            ...activePlan,
+          currentPlan = {
+            ...currentPlan,
             preRunContextMessages: projectContextMessages(
-              activePlan.preRunFullMessages,
+              currentPlan.preRunFullMessages,
               this.compactionCheckpoints,
             ),
           };
@@ -1913,16 +1976,16 @@ export class HarnessSession {
 
     const beforeStart = await this.extensions.emitBeforeAgentStart({
       type: "before_agent_start",
-      prompt: activePlan.promptText,
-      ...(activePlan.promptImages !== undefined ? { images: activePlan.promptImages } : {}),
-      systemPrompt: this.systemPrompt,
+      prompt: currentPlan.promptText,
+      ...(currentPlan.promptImages !== undefined ? { images: currentPlan.promptImages } : {}),
+      systemPrompt: getCurrentSystemPrompt(currentPlan.preRunContextMessages),
     });
     if (beforeStart?.systemPrompt !== undefined) {
       this.activeRunSystemPromptOverride = beforeStart.systemPrompt;
     }
 
     const preRunSnapshot = this.buildSnapshot({
-      messages: activePlan.preRunFullMessages,
+      messages: currentPlan.preRunFullMessages,
       compactions: this.compactionCheckpoints,
       status: "running",
       lastError: undefined,
@@ -1963,16 +2026,16 @@ export class HarnessSession {
       this.maxTurnsReachedInRun = false;
 
       let attemptMessages: AgentMessage[];
-      if (firstInvocation && activePlan.kind === "prompt") {
+      if (firstInvocation && currentPlan.kind === "prompt") {
         firstInvocation = false;
-        runHandle.pendingMessagesToSkip = new Set(activePlan.pendingMessages);
+        runHandle.pendingMessagesToSkip = new Set(currentPlan.pendingMessages);
         const attemptStart = this.agent.state.messages.length;
-        await this.agent.prompt(activePlan.pendingMessages);
+        await this.agent.prompt(currentPlan.pendingMessages);
         attemptMessages = this.agent.state.messages.slice(attemptStart);
       } else {
         if (firstInvocation) {
           firstInvocation = false;
-          this.agent.state.messages = structuredClone(activePlan.preRunContextMessages);
+          this.agent.state.messages = structuredClone(currentPlan.preRunContextMessages);
         }
         runHandle.pendingMessagesToSkip = new Set();
         const attemptStart = this.agent.state.messages.length;

@@ -160,6 +160,38 @@ export function defineTool<TParameters extends Record<string, any> = Record<stri
   return tool;
 }
 
+/**
+ * Dynamic, named system prompt section (aligned with `pi-durable`'s `PromptSection`).
+ *
+ * Rendered before each provider request; only minimal `SystemMessage.sections`
+ * delta patches are emitted so unchanged prefix sections keep prompt cache hits.
+ */
+export interface PromptSection {
+  /** Unique non-integer-like section key (e.g. `"workspace"`, `"skills"`, `"memory"`). */
+  readonly key: string;
+  /**
+   * Render section text for the upcoming request, or return `undefined` to omit/remove it.
+   * `shown` contains the sections currently active in the transcript after replaying prior patches.
+   */
+  render(
+    ctx: ExtensionContext,
+    shown: Readonly<Record<string, string>>,
+  ): string | undefined | Promise<string | undefined>;
+  /** Default `true`: wrap non-undefined text as `<key>\n...\n</key>`. Set `false` for raw text. */
+  readonly tag?: boolean;
+}
+
+export type PromptSectionWrapper = (section: PromptSection) => PromptSection;
+
+/** Typed builder helper for a `PromptSection` (mirrors `pi-durable`'s `section()`). */
+export function definePromptSection(
+  key: string,
+  render: PromptSection["render"],
+  options?: { readonly tag?: boolean },
+): PromptSection {
+  return options?.tag === undefined ? { key, render } : { key, render, tag: options.tag };
+}
+
 export interface SessionStartExtensionEvent {
   readonly type: "session_start";
   readonly reason: "create" | "open" | "fork";
@@ -426,6 +458,10 @@ export interface ExtensionAPI {
   registerTool<TParameters extends Record<string, any> = Record<string, any>, TDetails = unknown>(
     tool: ExtensionToolDefinition<TParameters, TDetails>,
   ): void;
+  /** Register or replace a named prompt section in place (preserving first-registration order). */
+  registerPromptSection(section: PromptSection): void;
+  /** Wrap an existing prompt section by key (mirrors `pi-durable`'s `wrapSection`). */
+  wrapPromptSection(key: string, wrapper: PromptSectionWrapper): void;
   getActiveTools(): string[];
   setActiveTools(toolNames: string[]): void;
   getAllTools(): ExtensionToolInfo[];
