@@ -22,6 +22,10 @@
       "types": "./dist/models/sqlite/index.d.ts",
       "import": "./dist/models/sqlite/index.js"
     },
+    "./models/indexeddb": {
+      "types": "./dist/models/indexeddb.d.ts",
+      "import": "./dist/models/indexeddb.js"
+    },
     "./models/node": {
       "types": "./dist/models/node/index.d.ts",
       "import": "./dist/models/node/index.js"

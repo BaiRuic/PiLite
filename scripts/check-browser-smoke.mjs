@@ -35,6 +35,7 @@ try {
     "src/session.ts",
     "src/extensions/index.ts",
     "src/models/index.ts",
+    "src/models/indexeddb.ts",
     "src/models/sqlite/index.ts",
     "src/store/memory.ts",
     "src/store/indexeddb.ts",

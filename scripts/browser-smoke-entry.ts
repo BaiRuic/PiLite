@@ -1,6 +1,7 @@
 import * as extensions from "../src/extensions/index.js";
 import * as core from "../src/index.js";
 import * as models from "../src/models/index.js";
+import * as modelsIndexedDb from "../src/models/indexeddb.js";
 import * as modelsSqlite from "../src/models/sqlite/index.js";
 import * as indexeddb from "../src/store/indexeddb.js";
 import * as jsonl from "../src/store/jsonl/index.js";
@@ -13,6 +14,7 @@ console.log(
   Object.keys(core),
   Object.keys(extensions),
   Object.keys(models),
+  Object.keys(modelsIndexedDb),
   Object.keys(modelsSqlite),
   Object.keys(memory),
   Object.keys(indexeddb),
