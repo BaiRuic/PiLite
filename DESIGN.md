@@ -27,6 +27,10 @@
 1. 宿主通过 `pi-ai` 的 `createModels()` 创建模型注册表、注册 provider（动态目录 provider 由宿主在注入前完成 `models.refresh()`）；认证完全在 `Models`/provider 一侧处理，harness 不额外注入 `getApiKey` 以免覆盖 OAuth 等凭据解析。
 2. 会话只保存 `ModelRef = { provider: string; modelId: string }`，不保存凭证或 provider 实现。
 3. harness 支持传入固定 `Models` 实例或热替换工厂 `() => Models`（`ModelsProvider`），每次 run 与模型请求前按 `ModelRef` 重新解析最新模型配置；模型不可用时显式报错（`MODEL_NOT_FOUND`），不静默切换到其他模型。
+4. 可选模型管理子模块（保持核心会话层零侵入，最终统一产出 `pi-ai` `Models`）：
+   - `pi-harness/models`（可移植核心）：提供总装入口 `createModelHub()`（输出热替换 `asModelsProvider()`）、自建后端工厂 `createApiBackendProvider()`（支持 JWT/动态请求头、OpenAI `/models` 自动发现或自定义 `parseModels`/`fetchModels`、混合协议懒加载）、本地抽象加载源 `LocalModelSource` 与配置合并器（支持本地无密钥服务自动探测、内置厂商 `baseUrl`/`headers`/`modelOverrides` 局部覆写，默认仅启用 `$ENV` 插值，`!command` 需显式 opt-in）。
+   - `pi-harness/models/sqlite`：复用可移植 `SqliteDatabase` 提供 `SqliteCredentialStore`（事务串行防并发双刷 OAuth token）与 `SqliteModelsStore`（动态目录离线缓存，可与 `SqliteSessionStore` 共用同一数据库文件）。
+   - `pi-harness/models/node`：提供原子 JSON 文件版 `FileCredentialStore` / `FileModelsStore`、JSON/JSONC 本地源 `createJsonFileModelSource()` 以及纯 `node:readline` 的 OAuth CLI 交互桥接 `createCliAuthInteraction()`。
 
 ### 会话存储与恢复
 
