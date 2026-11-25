@@ -4,10 +4,18 @@ import { join } from "node:path";
 // @ts-expect-error -- `bun:test` is provided by the Bun runtime.
 import { describe, expect, it } from "bun:test";
 import {
+  createSqliteCredentialStore,
+  createSqliteModelsStore,
+} from "../src/models/sqlite/index.js";
+import {
   openBunSqliteDatabase,
   openBunSqliteSessionStore,
 } from "../src/store/sqlite/bun.js";
-import { registerSessionStoreContract } from "../src/testing.js";
+import {
+  registerCredentialStoreContract,
+  registerModelsStoreContract,
+  registerSessionStoreContract,
+} from "../src/testing.js";
 import { SESSION_SNAPSHOT_VERSION, type SessionSnapshot } from "../src/types.js";
 
 registerSessionStoreContract(
@@ -102,3 +110,29 @@ describe("SqliteSessionStore (bun:sqlite specifics)", () => {
     }
   });
 });
+
+registerCredentialStoreContract(
+  { describe, it, expect },
+  "SqliteCredentialStore (bun:sqlite :memory:)",
+  async (use) => {
+    const db = await openBunSqliteDatabase(":memory:");
+    try {
+      await use(createSqliteCredentialStore(db));
+    } finally {
+      await db.close();
+    }
+  },
+);
+
+registerModelsStoreContract(
+  { describe, it, expect },
+  "SqliteModelsStore (bun:sqlite :memory:)",
+  async (use) => {
+    const db = await openBunSqliteDatabase(":memory:");
+    try {
+      await use(createSqliteModelsStore(db));
+    } finally {
+      await db.close();
+    }
+  },
+);
