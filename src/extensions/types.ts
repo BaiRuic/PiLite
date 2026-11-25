@@ -7,7 +7,15 @@ import type {
   ThinkingLevel,
   ToolExecutionMode,
 } from "@earendil-works/pi-agent-core";
-import type { Api, ImageContent, JsonValue, Model, TextContent, Usage } from "@earendil-works/pi-ai";
+import type {
+  Api,
+  ImageContent,
+  JsonValue,
+  Model,
+  ProviderHeaders,
+  TextContent,
+  Usage,
+} from "@earendil-works/pi-ai";
 import type { Static } from "@earendil-works/pi-schema";
 import type {
   CompactionCheckpoint,
@@ -234,11 +242,55 @@ export interface BeforeProviderRequestEvent {
  */
 export type BeforeProviderRequestResult = unknown;
 
+/**
+ * Fired after request headers are assembled, before the provider HTTP call.
+ * Handlers mutate `headers` in place (setting a key to `null` deletes that header);
+ * the return value is ignored.
+ */
+export interface BeforeProviderHeadersEvent {
+  readonly type: "before_provider_headers";
+  readonly headers: ProviderHeaders;
+  readonly model: Model<Api>;
+}
+
 export interface AfterProviderResponseEvent {
   readonly type: "after_provider_response";
   readonly response: unknown;
   readonly model: Model<Api>;
 }
+
+export type ModelSelectSource = "set" | "cycle" | "restore";
+
+/** Fired when the session's active model changes. */
+export interface ModelSelectEvent {
+  readonly type: "model_select";
+  readonly model: Model<Api>;
+  readonly previousModel: Model<Api> | undefined;
+  readonly source: ModelSelectSource;
+}
+
+/** Fired when the session's active thinking level changes. */
+export interface ThinkingLevelSelectEvent {
+  readonly type: "thinking_level_select";
+  readonly level: ThinkingLevel;
+  readonly previousLevel: ThinkingLevel;
+}
+
+export type InputSource = "interactive" | "rpc" | "extension";
+
+/** Fired when user text input is received by `session.prompt()`, before agent processing. */
+export interface InputEvent {
+  readonly type: "input";
+  readonly text: string;
+  readonly images?: ImageContent[];
+  readonly source: InputSource;
+  readonly streamingBehavior?: "steer" | "followUp";
+}
+
+export type InputEventResult =
+  | { readonly action: "continue" }
+  | { readonly action: "transform"; readonly text: string; readonly images?: ImageContent[] }
+  | { readonly action: "handled" };
 
 export interface ToolCallExtensionEvent {
   readonly type: "tool_call";
@@ -288,10 +340,14 @@ export interface ExtensionEventMap extends AgentEventByType {
   session_before_compact: SessionBeforeCompactEvent;
   session_compact: SessionCompactEvent;
   session_compact_failed: SessionCompactFailedEvent;
+  input: InputEvent;
   before_agent_start: BeforeAgentStartEvent;
   context: ContextExtensionEvent;
   before_provider_request: BeforeProviderRequestEvent;
+  before_provider_headers: BeforeProviderHeadersEvent;
   after_provider_response: AfterProviderResponseEvent;
+  model_select: ModelSelectEvent;
+  thinking_level_select: ThinkingLevelSelectEvent;
   tool_call: ToolCallExtensionEvent;
   tool_result: ToolResultExtensionEvent;
 }
@@ -302,10 +358,14 @@ export interface ExtensionEventResultMap {
   session_before_compact: SessionBeforeCompactResult | void;
   session_compact: void;
   session_compact_failed: void;
+  input: InputEventResult | void;
   before_agent_start: BeforeAgentStartResult | void;
   context: ContextExtensionResult | void;
   before_provider_request: BeforeProviderRequestResult | void;
+  before_provider_headers: void;
   after_provider_response: void;
+  model_select: void;
+  thinking_level_select: void;
   tool_call: ToolCallExtensionResult | void;
   tool_result: ToolResultExtensionResult | void;
   agent_start: void;

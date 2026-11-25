@@ -369,7 +369,14 @@ export class HarnessSession {
       streamFn: (reqModel, context, streamOptions) => {
         const currentModels = this.getModels();
         const freshModel = currentModels.getModel(reqModel.provider, reqModel.id) ?? reqModel;
-        return currentModels.streamSimple(freshModel, context, streamOptions);
+        return currentModels.streamSimple(freshModel, context, {
+          ...streamOptions,
+          ...(this.extensions.hasHandlers("before_provider_headers")
+            ? {
+                transformHeaders: (headers) => this.extensions.emitBeforeProviderHeaders(headers, freshModel),
+              }
+            : {}),
+        });
       },
       sessionId: snapshot.sessionId,
       identity: this.identity,
@@ -437,7 +444,15 @@ export class HarnessSession {
       getThinkingLevel: () => this.thinkingLevel,
       setThinkingLevel: async (level) => {
         if (this.activeRun) {
+          const previousLevel = this.agent.state.thinkingLevel;
           this.agent.state.thinkingLevel = level;
+          if (level !== previousLevel) {
+            await this.extensions.emitThinkingLevelSelect({
+              type: "thinking_level_select",
+              level,
+              previousLevel,
+            });
+          }
           return;
         }
         await this.setThinkingLevel(level);
@@ -839,6 +854,7 @@ export class HarnessSession {
   /** Switch the session's model while idle and persist the updated `ModelRef`. */
   async setModel(modelRef: ModelRef): Promise<void> {
     this.assertReadyForRun();
+    const previousModel = this.resolvedModel;
     const resolved = resolveModelOrThrow(this.getModels(), modelRef);
     const updated = this.buildSnapshot({
       model: { provider: modelRef.provider, modelId: modelRef.modelId },
@@ -849,11 +865,20 @@ export class HarnessSession {
     await this.store.save(this.sessionId, updated);
     this.agent.state.model = resolved;
     this.committedSnapshot = structuredClone(updated);
+    if (previousModel?.provider !== resolved.provider || previousModel?.id !== resolved.id) {
+      await this.extensions.emitModelSelect({
+        type: "model_select",
+        model: resolved,
+        previousModel,
+        source: "set",
+      });
+    }
   }
 
   /** Change the session's thinking level while idle and persist it. */
   async setThinkingLevel(level: ThinkingLevel): Promise<void> {
     this.assertReadyForRun();
+    const previousLevel = this.agent.state.thinkingLevel;
     const updated = this.buildSnapshot({
       thinkingLevel: level,
       messages: this.committedSnapshot.messages,
@@ -863,6 +888,13 @@ export class HarnessSession {
     await this.store.save(this.sessionId, updated);
     this.agent.state.thinkingLevel = level;
     this.committedSnapshot = structuredClone(updated);
+    if (level !== previousLevel) {
+      await this.extensions.emitThinkingLevelSelect({
+        type: "thinking_level_select",
+        level,
+        previousLevel,
+      });
+    }
   }
 
   /** Set or clear the session's display title while idle and persist it. */
@@ -1105,7 +1137,24 @@ export class HarnessSession {
     images?: ImageContent[],
   ): Promise<SessionRunResult> {
     this.assertReadyForRun();
-    const userMessages = normalizePromptInput(input, images, this.now);
+    let effectiveInput = input;
+    let effectiveImages = images;
+    if (typeof input === "string" && this.extensions.hasHandlers("input")) {
+      const inputResult = await this.extensions.emitInput(input, images, "interactive");
+      if (inputResult.action === "handled") {
+        return {
+          status: "idle",
+          snapshot: this.getSnapshot(),
+        };
+      }
+      if (inputResult.action === "transform") {
+        effectiveInput = inputResult.text;
+        effectiveImages = inputResult.images ?? images;
+      }
+      this.assertReadyForRun();
+    }
+
+    const userMessages = normalizePromptInput(effectiveInput, effectiveImages, this.now);
     const systemPatch = buildSystemPromptPatch(this.agent.state.messages, this.desiredSystemPrompt, this.now);
     const pendingMessages: AgentMessage[] = systemPatch ? [systemPatch, ...userMessages] : userMessages;
 

@@ -769,4 +769,175 @@ describe("Headless Extension System", () => {
     expect(reopened.thinkingLevel).toBe("high");
     expect(apiHandle.getAllTools().map((t) => t.name)).toEqual(["meta_tool"]);
   });
+
+  it("supports before_provider_headers in-place mutation and header deletion", async () => {
+    const faux = fauxProvider({ provider: "faux", models: [{ id: "faux-1" }] });
+    faux.models[0].headers = { "x-default": "keep", "x-drop-me": "remove" };
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const store = new InMemorySessionStore();
+
+    let receivedHeaders: Record<string, string | null> | undefined;
+    const headerExt: ExtensionFactory = (pi) => {
+      pi.on("before_provider_headers", (event) => {
+        event.headers["x-trace-id"] = `trace-${event.model.id}`;
+      });
+      pi.on("before_provider_headers", (event) => {
+        if (event.headers["x-trace-id"] === "trace-faux-1") {
+          event.headers["x-tenant"] = "acme";
+          event.headers["x-drop-me"] = null;
+        }
+      });
+    };
+
+    faux.setResponses([
+      (_context, options) => {
+        receivedHeaders = options?.headers ? { ...options.headers } : undefined;
+        return fauxAssistantMessage("Headers applied.");
+      },
+    ]);
+
+    const session = await createSession({
+      sessionId: "sess-headers",
+      models,
+      store,
+      model: { provider: "faux", modelId: "faux-1" },
+      extensions: [headerExt],
+    });
+
+    await session.prompt("Ping");
+    expect(receivedHeaders).toEqual({
+      "x-default": "keep",
+      "x-trace-id": "trace-faux-1",
+      "x-tenant": "acme",
+      "x-drop-me": null,
+    });
+  });
+
+  it("emits model_select and thinking_level_select only when values actually change", async () => {
+    const faux = fauxProvider({
+      provider: "faux",
+      models: [{ id: "faux-1" }, { id: "faux-2" }],
+    });
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const store = new InMemorySessionStore();
+
+    const modelEvents: Array<{ modelId: string; previousModelId?: string; source: string }> = [];
+    const thinkingEvents: Array<{ level: string; previousLevel: string }> = [];
+
+    const observerExt: ExtensionFactory = (pi) => {
+      pi.on("model_select", (event) => {
+        modelEvents.push({
+          modelId: event.model.id,
+          previousModelId: event.previousModel?.id,
+          source: event.source,
+        });
+      });
+      pi.on("thinking_level_select", (event) => {
+        thinkingEvents.push({
+          level: event.level,
+          previousLevel: event.previousLevel,
+        });
+      });
+      pi.registerTool(
+        defineTool({
+          name: "bump_thinking",
+          description: "Changes thinking level mid-run",
+          parameters: obj({}),
+          execute: async () => {
+            await pi.setThinkingLevel("high");
+            // Repeating the same level should not emit a duplicate event.
+            await pi.setThinkingLevel("high");
+            return { content: [{ type: "text", text: "bumped" }], details: {} };
+          },
+        }),
+      );
+    };
+
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("bump_thinking", {}, { id: "tc-bump" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("All set."),
+    ]);
+
+    const session = await createSession({
+      sessionId: "sess-select-events",
+      models,
+      store,
+      model: { provider: "faux", modelId: "faux-1" },
+      extensions: [observerExt],
+    });
+
+    // No-op model/thinking changes do not fire events.
+    await session.setModel({ provider: "faux", modelId: "faux-1" });
+    await session.setThinkingLevel("off");
+    expect(modelEvents).toEqual([]);
+    expect(thinkingEvents).toEqual([]);
+
+    // Actual changes fire events.
+    await session.setModel({ provider: "faux", modelId: "faux-2" });
+    await session.setThinkingLevel("medium");
+    expect(modelEvents).toEqual([{ modelId: "faux-2", previousModelId: "faux-1", source: "set" }]);
+    expect(thinkingEvents).toEqual([{ level: "medium", previousLevel: "off" }]);
+
+    // Mid-run change via pi.setThinkingLevel() also emits thinking_level_select.
+    await session.prompt("Bump thinking");
+    expect(thinkingEvents).toEqual([
+      { level: "medium", previousLevel: "off" },
+      { level: "high", previousLevel: "medium" },
+    ]);
+  });
+
+  it("supports input hook chaining (transform with image preservation and handled short-circuit)", async () => {
+    const { faux, models, store } = createTestEnv();
+    const handledCommands: string[] = [];
+    let modelSeenUserContent: unknown;
+
+    const inputExt: ExtensionFactory = (pi) => {
+      pi.on("input", (event) => {
+        if (event.text.startsWith("/local")) {
+          handledCommands.push(event.text);
+          return { action: "handled" };
+        }
+        if (event.text.includes("@note")) {
+          return { action: "transform", text: event.text.replace("@note", "[NOTE:42]") };
+        }
+        return { action: "continue" };
+      });
+      pi.on("input", (event) => {
+        // Chains after the previous transform while keeping images intact when omitted.
+        return { action: "transform", text: `${event.text} [verified]` };
+      });
+    };
+
+    faux.setResponses([
+      (context) => {
+        const lastUser = [...context.messages].reverse().find((m) => m.role === "user");
+        modelSeenUserContent = lastUser?.content;
+        return fauxAssistantMessage("Processed transformed input.");
+      },
+    ]);
+
+    const session = await createSession({
+      sessionId: "sess-input-hook",
+      models,
+      store,
+      model: { provider: "faux", modelId: "faux-1" },
+      extensions: [inputExt],
+    });
+
+    const image = { type: "image" as const, data: "AQID", mimeType: "image/png" };
+    const r1 = await session.prompt("Check @note", [image]);
+    expect(r1.status).toBe("idle");
+    expect(modelSeenUserContent).toEqual([{ type: "text", text: "Check [NOTE:42] [verified]" }, image]);
+    expect(faux.state.callCount).toBe(1);
+
+    const messagesBeforeHandled = session.getSnapshot().messages.length;
+    const r2 = await session.prompt("/local status");
+    expect(r2.status).toBe("idle");
+    expect(handledCommands).toEqual(["/local status"]);
+    // Handled input short-circuits without calling the model or mutating transcript.
+    expect(faux.state.callCount).toBe(1);
+    expect(r2.snapshot.messages.length).toBe(messagesBeforeHandled);
+  });
 });

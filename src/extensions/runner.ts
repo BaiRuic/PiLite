@@ -7,7 +7,7 @@ import type {
   BeforeToolCallResult,
   ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, ImageContent, Model, ProviderHeaders } from "@earendil-works/pi-ai";
 import type { CustomSessionEntry, SessionSnapshot } from "../types.js";
 import { BUILTIN_COMPACTION_EXTENSION_NAME } from "./default-compaction.js";
 import type {
@@ -30,10 +30,15 @@ import type {
   ExtensionToolInfo,
   ExtensionUIAdapter,
   ExtensionUIContext,
+  InputEvent,
+  InputEventResult,
+  InputSource,
+  ModelSelectEvent,
   SessionBeforeCompactEvent,
   SessionBeforeCompactResult,
   SessionCompactEvent,
   SessionCompactFailedEvent,
+  ThinkingLevelSelectEvent,
   ToolCallExtensionEvent,
   ToolCallExtensionResult,
   ToolResultExtensionEvent,
@@ -46,10 +51,14 @@ const SUPPORTED_EVENTS = new Set<string>([
   "session_before_compact",
   "session_compact",
   "session_compact_failed",
+  "input",
   "before_agent_start",
   "context",
   "before_provider_request",
+  "before_provider_headers",
   "after_provider_response",
+  "model_select",
+  "thinking_level_select",
   "tool_call",
   "tool_result",
   "agent_start",
@@ -397,12 +406,83 @@ export class ExtensionRunner {
     return current;
   }
 
+  async emitBeforeProviderHeaders(headers: ProviderHeaders, model: Model<Api>): Promise<ProviderHeaders> {
+    const list = this.handlers.get("before_provider_headers");
+    if (!list || list.length === 0) return headers;
+
+    const ctx = this.createContext();
+    for (const handler of [...list]) {
+      try {
+        await handler.fn({ type: "before_provider_headers", headers, model }, ctx);
+      } catch (error) {
+        this.reportHandlerError(handler.extensionName, "before_provider_headers", error);
+      }
+    }
+    return headers;
+  }
+
   async emitAfterProviderResponse(response: unknown, model: Model<Api>): Promise<void> {
     await this.emitNotification("after_provider_response", {
       type: "after_provider_response",
       response,
       model,
     });
+  }
+
+  async emitModelSelect(event: ModelSelectEvent): Promise<void> {
+    await this.emitNotification("model_select", event);
+  }
+
+  async emitThinkingLevelSelect(event: ThinkingLevelSelectEvent): Promise<void> {
+    await this.emitNotification("thinking_level_select", event);
+  }
+
+  /** Emit `input` event. Transforms chain in registration order; `"handled"` short-circuits. */
+  async emitInput(
+    text: string,
+    images: ImageContent[] | undefined,
+    source: InputSource,
+    streamingBehavior?: "steer" | "followUp",
+  ): Promise<InputEventResult> {
+    const list = this.handlers.get("input");
+    if (!list || list.length === 0) {
+      return { action: "continue" };
+    }
+
+    const ctx = this.createContext();
+    let currentText = text;
+    let currentImages = images;
+
+    for (const handler of [...list]) {
+      try {
+        const event: InputEvent = {
+          type: "input",
+          text: currentText,
+          ...(currentImages !== undefined ? { images: currentImages } : {}),
+          source,
+          ...(streamingBehavior !== undefined ? { streamingBehavior } : {}),
+        };
+        const result = (await handler.fn(event, ctx)) as InputEventResult | undefined;
+        if (result?.action === "handled") {
+          return result;
+        }
+        if (result?.action === "transform") {
+          currentText = result.text;
+          currentImages = result.images ?? currentImages;
+        }
+      } catch (error) {
+        this.reportHandlerError(handler.extensionName, "input", error);
+      }
+    }
+
+    if (currentText !== text || currentImages !== images) {
+      return {
+        action: "transform",
+        text: currentText,
+        ...(currentImages !== undefined ? { images: currentImages } : {}),
+      };
+    }
+    return { action: "continue" };
   }
 
   async emitToolCall(event: ToolCallExtensionEvent): Promise<BeforeToolCallResult | undefined> {
