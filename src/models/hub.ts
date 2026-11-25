@@ -21,8 +21,14 @@ import {
   type Provider,
   type ProviderStreams,
 } from "@earendil-works/pi-ai";
-import type { ModelsProvider } from "../types.js";
+import { HarnessError, type ModelsProvider } from "../types.js";
 import type { ConfigValueResolverOptions } from "./config-value.js";
+import {
+  createOpenAIEmbeddingProvider,
+  type EmbeddingModel,
+  type EmbeddingProvider,
+  type OpenAIEmbeddingProviderOptions,
+} from "./embedding.js";
 import {
   composeLocalProvider,
   mergeLocalModelsConfigs,
@@ -41,6 +47,8 @@ export interface CreateModelHubOptions {
   readonly providers?: readonly Provider<Api>[];
   /** Local model configuration sources (JSON files, DB settings, UI config, etc.) applied in order. */
   readonly localSources?: readonly LocalModelSource[];
+  /** Optional statically registered embedding models (in addition to any declared in `localSources`). */
+  readonly embeddingModels?: readonly EmbeddingModel[];
   /** Environment/command resolver options for `$ENV` (and optional opt-in `!command`) in local configs. */
   readonly configResolver?: Omit<ConfigValueResolverOptions, "signal">;
   /** Injectable `fetch` used by `discover: true` local providers. */
@@ -76,6 +84,7 @@ export class ModelHub {
   private readonly authContext?: AuthContext;
   private readonly identity?: ClientIdentity;
   private readonly baseProviders = new Map<string, Provider<Api>>();
+  private readonly registeredEmbeddingModels = new Map<string, EmbeddingModel>();
   private readonly localSources: LocalModelSource[];
   private readonly configResolver?: Omit<ConfigValueResolverOptions, "signal">;
   private readonly fetchImpl?: typeof globalThis.fetch;
@@ -96,6 +105,9 @@ export class ModelHub {
 
     for (const provider of options.providers ?? []) {
       this.baseProviders.set(provider.id, provider);
+    }
+    for (const model of options.embeddingModels ?? []) {
+      this.registeredEmbeddingModels.set(`${model.provider}\0${model.id}`, structuredClone(model));
     }
 
     this.activeModels = this.buildModelsInstance();
@@ -208,6 +220,106 @@ export class ModelHub {
       return this.activeModels.getAuth(providerOrModel, overrides);
     }
     return this.activeModels.getAuth(providerOrModel, overrides);
+  }
+
+  /** Register or update selectable embedding models programmatically (e.g. from a custom backend). */
+  registerEmbeddingModels(models: readonly EmbeddingModel[]): void {
+    for (const model of models) {
+      this.registeredEmbeddingModels.set(`${model.provider}\0${model.id}`, structuredClone(model));
+    }
+  }
+
+  /** Replace all programmatically registered embedding models for one provider. */
+  setEmbeddingModels(providerId: string, models: readonly EmbeddingModel[]): void {
+    for (const key of [...this.registeredEmbeddingModels.keys()]) {
+      if (key.startsWith(`${providerId}\0`)) {
+        this.registeredEmbeddingModels.delete(key);
+      }
+    }
+    this.registerEmbeddingModels(models);
+  }
+
+  /** List all known embedding models (combining programmatic registrations and `localSources`). */
+  getEmbeddingModels(providerId?: string): EmbeddingModel[] {
+    const merged = new Map<string, EmbeddingModel>();
+    for (const [key, model] of this.registeredEmbeddingModels) {
+      if (providerId !== undefined && model.provider !== providerId) continue;
+      merged.set(key, structuredClone(model));
+    }
+
+    for (const [pid, cfg] of Object.entries(this.localConfig.providers)) {
+      if (providerId !== undefined && pid !== providerId) continue;
+      if (!cfg.embeddingModels?.length) continue;
+      const providerBaseUrl = cfg.baseUrl ?? this.activeModels.getProvider(pid)?.baseUrl ?? "";
+      for (const def of cfg.embeddingModels) {
+        const baseUrl = def.baseUrl ?? providerBaseUrl;
+        if (!baseUrl) continue;
+        merged.set(`${pid}\0${def.id}`, {
+          id: def.id,
+          name: def.name ?? def.id,
+          provider: pid,
+          baseUrl,
+          ...(def.dimensions !== undefined ? { dimensions: def.dimensions } : {}),
+          ...(def.maxInputTokens !== undefined ? { maxInputTokens: def.maxInputTokens } : {}),
+          ...(def.headers ? { headers: { ...def.headers } } : {}),
+        });
+      }
+    }
+
+    return [...merged.values()];
+  }
+
+  /** Look up one embedding model by provider and model ID. */
+  getEmbeddingModel(providerId: string, modelId: string): EmbeddingModel | undefined {
+    return this.getEmbeddingModels(providerId).find((m) => m.id === modelId);
+  }
+
+  /** Return embedding models whose owning provider currently has configured auth (or keyless local access). */
+  async getAvailableEmbeddingModels(
+    providerId?: string,
+    options?: AuthOperationOptions,
+  ): Promise<EmbeddingModel[]> {
+    const all = this.getEmbeddingModels(providerId);
+    if (all.length === 0) return [];
+    const providerIds = [...new Set(all.map((m) => m.provider))];
+    const checks = await Promise.all(
+      providerIds.map(async (pid) => [pid, Boolean(await this.checkAuth(pid, options))] as const),
+    );
+    const configured = new Set(checks.filter(([, ok]) => ok).map(([pid]) => pid));
+    return all.filter((m) => configured.has(m.provider));
+  }
+
+  /**
+   * Instantiate an `EmbeddingProvider` for a selected `(providerId, modelId)`,
+   * automatically reusing this hub's auth (API key, JWT, OAuth, headers, baseUrl).
+   */
+  createEmbeddingProvider(
+    providerId: string,
+    modelId: string,
+    overrides: Partial<
+      Omit<OpenAIEmbeddingProviderOptions, "modelId" | "authFrom" | "model">
+    > = {},
+  ): EmbeddingProvider {
+    const known = this.getEmbeddingModel(providerId, modelId);
+    const registeredProvider = this.activeModels.getProvider(providerId);
+    if (!known && !registeredProvider && !overrides.baseUrl) {
+      throw new HarnessError(
+        "MODEL_NOT_FOUND",
+        `Embedding model "${providerId}/${modelId}" is not registered and provider "${providerId}" was not found.`,
+      );
+    }
+
+    const baseUrl = overrides.baseUrl ?? known?.baseUrl ?? registeredProvider?.baseUrl;
+    return createOpenAIEmbeddingProvider({
+      id: providerId,
+      modelId,
+      ...(known ? { model: known } : {}),
+      ...(baseUrl ? { baseUrl } : {}),
+      ...(registeredProvider ? { authFrom: { models: this, providerId } } : {}),
+      ...(this.fetchImpl ? { fetch: this.fetchImpl } : {}),
+      ...(this.configResolver ? { configResolver: this.configResolver } : {}),
+      ...overrides,
+    });
   }
 
   /** List providers that support interactive OAuth or API-key login flows. */

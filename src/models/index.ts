@@ -14,6 +14,14 @@ export {
   type ConfigValueResolverOptions,
 } from "./config-value.js";
 export {
+  createOpenAIEmbeddingProvider,
+  type AuthSourceModels,
+  type EmbeddingModel,
+  type EmbeddingOptions,
+  type EmbeddingProvider,
+  type OpenAIEmbeddingProviderOptions,
+} from "./embedding.js";
+export {
   createModelHub,
   ModelHub,
   type CreateModelHubOptions,
@@ -25,6 +33,7 @@ export {
   createStaticLocalModelSource,
   mergeLocalModelsConfigs,
   type ComposeLocalProviderOptions,
+  type LocalEmbeddingModelDefinition,
   type LocalModelDefinition,
   type LocalModelOverride,
   type LocalModelsConfig,

@@ -36,6 +36,15 @@ export interface LocalModelOverride {
   readonly compat?: Model<Api>["compat"];
 }
 
+export interface LocalEmbeddingModelDefinition {
+  readonly id: string;
+  readonly name?: string;
+  readonly baseUrl?: string;
+  readonly dimensions?: number;
+  readonly maxInputTokens?: number;
+  readonly headers?: Readonly<Record<string, string>>;
+}
+
 export interface LocalProviderConfig {
   readonly name?: string;
   readonly baseUrl?: string;
@@ -54,6 +63,8 @@ export interface LocalProviderConfig {
   readonly modelsEndpoint?: string;
   readonly models?: readonly LocalModelDefinition[];
   readonly modelOverrides?: Readonly<Record<string, LocalModelOverride>>;
+  /** Optional embedding models served by this provider so hosts can list and select them via `ModelHub`. */
+  readonly embeddingModels?: readonly LocalEmbeddingModelDefinition[];
 }
 
 export interface LocalModelsConfig {
@@ -208,6 +219,13 @@ export function mergeLocalModelsConfigs(configs: readonly LocalModelsConfig[]): 
         else mergedModels.push(structuredClone(def));
       }
 
+      const mergedEmbeddings = [...(prev.embeddingModels ?? [])];
+      for (const def of next.embeddingModels ?? []) {
+        const idx = mergedEmbeddings.findIndex((m) => m.id === def.id);
+        if (idx >= 0) mergedEmbeddings[idx] = structuredClone(def);
+        else mergedEmbeddings.push(structuredClone(def));
+      }
+
       const mergedOverrides: Record<string, LocalModelOverride> = {
         ...structuredClone(prev.modelOverrides ?? {}),
       };
@@ -224,6 +242,7 @@ export function mergeLocalModelsConfigs(configs: readonly LocalModelsConfig[]): 
         headers: mergeStringHeaders(prev.headers, next.headers),
         compat: mergeCompat(prev.compat, next.compat),
         ...(mergedModels.length > 0 ? { models: mergedModels } : {}),
+        ...(mergedEmbeddings.length > 0 ? { embeddingModels: mergedEmbeddings } : {}),
         ...(Object.keys(mergedOverrides).length > 0 ? { modelOverrides: mergedOverrides } : {}),
       };
     }
