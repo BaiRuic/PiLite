@@ -40,6 +40,7 @@ import {
   createDefaultCompactionExtension,
 } from "./extensions/default-compaction.js";
 import { ExtensionRunner } from "./extensions/runner.js";
+import type { InputSource, SendUserMessageOptions } from "./extensions/types.js";
 import { buildSystemPromptPatch, createInitialTranscript } from "./system-prompt.js";
 import {
   type BaseSessionOptions,
@@ -206,6 +207,28 @@ function resolveModelOrThrow(models: Models, ref: ModelRef): Model<Api> {
     );
   }
   return model;
+}
+
+function normalizeExtensionUserContent(content: string | (TextContent | ImageContent)[]): {
+  readonly text: string;
+  readonly images: ImageContent[] | undefined;
+} {
+  if (typeof content === "string") {
+    return { text: content, images: undefined };
+  }
+  const textParts: string[] = [];
+  const images: ImageContent[] = [];
+  for (const part of content) {
+    if (part.type === "text") {
+      textParts.push(part.text);
+    } else {
+      images.push(part);
+    }
+  }
+  return {
+    text: textParts.join("\n"),
+    images: images.length > 0 ? images : undefined,
+  };
 }
 
 function normalizePromptInput(
@@ -466,6 +489,7 @@ export class HarnessSession {
         }
         await this.setTitle(name);
       },
+      sendUserMessage: (content, sendOptions) => this.sendUserMessageFromExtension(content, sendOptions),
       ui: options.ui,
       exec: options.exec,
       onDiagnostic: options.onExtensionDiagnostic,
@@ -1136,11 +1160,20 @@ export class HarnessSession {
     input: string | AgentMessage | AgentMessage[],
     images?: ImageContent[],
   ): Promise<SessionRunResult> {
+    return this.promptWithSource(input, images, "interactive");
+  }
+
+  private async promptWithSource(
+    input: string | AgentMessage | AgentMessage[],
+    images: ImageContent[] | undefined,
+    source: InputSource,
+    skipInputHook = false,
+  ): Promise<SessionRunResult> {
     this.assertReadyForRun();
     let effectiveInput = input;
     let effectiveImages = images;
-    if (typeof input === "string" && this.extensions.hasHandlers("input")) {
-      const inputResult = await this.extensions.emitInput(input, images, "interactive");
+    if (!skipInputHook && typeof input === "string" && this.extensions.hasHandlers("input")) {
+      const inputResult = await this.extensions.emitInput(input, images, source);
       if (inputResult.action === "handled") {
         return {
           status: "idle",
@@ -1171,6 +1204,48 @@ export class HarnessSession {
         ...structuredClone(pendingMessages),
       ],
     });
+  }
+
+  private sendUserMessageFromExtension(
+    content: string | (TextContent | ImageContent)[],
+    options?: SendUserMessageOptions,
+  ): void | Promise<void> {
+    const { text, images } = normalizeExtensionUserContent(content);
+
+    if (this.isRunning) {
+      const deliverAs = options?.deliverAs;
+      if (!deliverAs) {
+        throw new HarnessError(
+          "SESSION_BUSY",
+          `Session "${this.sessionId}" is running. Specify deliverAs ("steer" | "followUp") when calling pi.sendUserMessage() during an active run.`,
+        );
+      }
+      if (!this.extensions.hasHandlers("input")) {
+        if (deliverAs === "steer") {
+          this.steer(text, images);
+        } else {
+          this.followUp(text, images);
+        }
+        return;
+      }
+      return (async () => {
+        const inputResult = await this.extensions.emitInput(text, images, "extension", deliverAs);
+        if (inputResult.action === "handled") return;
+        const nextText = inputResult.action === "transform" ? inputResult.text : text;
+        const nextImages = inputResult.action === "transform" ? (inputResult.images ?? images) : images;
+        if (this.isRunning) {
+          if (deliverAs === "steer") {
+            this.steer(nextText, nextImages);
+          } else {
+            this.followUp(nextText, nextImages);
+          }
+          return;
+        }
+        await this.promptWithSource(nextText, nextImages, "extension", true);
+      })();
+    }
+
+    return this.promptWithSource(text, images, "extension").then(() => undefined);
   }
 
   /**

@@ -7,7 +7,7 @@ import type {
   BeforeToolCallResult,
   ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import type { Api, ImageContent, Model, ProviderHeaders } from "@earendil-works/pi-ai";
+import type { Api, ImageContent, Model, ProviderHeaders, TextContent } from "@earendil-works/pi-ai";
 import type { CustomSessionEntry, SessionSnapshot } from "../types.js";
 import { BUILTIN_COMPACTION_EXTENSION_NAME } from "./default-compaction.js";
 import type {
@@ -34,6 +34,7 @@ import type {
   InputEventResult,
   InputSource,
   ModelSelectEvent,
+  SendUserMessageOptions,
   SessionBeforeCompactEvent,
   SessionBeforeCompactResult,
   SessionCompactEvent,
@@ -85,6 +86,10 @@ export interface ExtensionHostBindings {
   setThinkingLevel(level: ThinkingLevel): Promise<void>;
   getSessionName(): string | undefined;
   setSessionName(name: string | undefined): Promise<void>;
+  sendUserMessage(
+    content: string | (TextContent | ImageContent)[],
+    options?: SendUserMessageOptions,
+  ): void | Promise<void>;
   readonly ui?: ExtensionUIAdapter;
   readonly exec?: ExtensionExecFn;
   readonly onDiagnostic?: (diagnostic: ExtensionDiagnostic) => void;
@@ -666,6 +671,19 @@ export class ExtensionRunner {
       setThinkingLevel: (level: ThinkingLevel) => this.requireBindings().setThinkingLevel(level),
       getSessionName: () => this.requireBindings().getSessionName(),
       setSessionName: (name: string | undefined) => this.requireBindings().setSessionName(name),
+      sendUserMessage: (content, options) => {
+        const bindings = this.requireBindings();
+        try {
+          const result = bindings.sendUserMessage(content, options);
+          if (result && typeof result.then === "function") {
+            void result.catch((error) => {
+              this.reportHandlerError(extensionName, "send_user_message", error);
+            });
+          }
+        } catch (error) {
+          this.reportHandlerError(extensionName, "send_user_message", error);
+        }
+      },
       appendEntry: <T = unknown>(customType: string, data?: T): CustomSessionEntry<T> => {
         const bindings = this.requireBindings();
         return bindings.appendCustomEntry(customType, data);

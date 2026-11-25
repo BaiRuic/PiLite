@@ -663,6 +663,7 @@ describe("Headless Extension System", () => {
       setThinkingLevel: async () => undefined,
       getSessionName: () => undefined,
       setSessionName: async () => undefined,
+      sendUserMessage: () => undefined,
       getSystemPrompt: () => "",
       getSnapshot: () => {
         throw new Error("unused");
@@ -939,5 +940,124 @@ describe("Headless Extension System", () => {
     // Handled input short-circuits without calling the model or mutating transcript.
     expect(faux.state.callCount).toBe(1);
     expect(r2.snapshot.messages.length).toBe(messagesBeforeHandled);
+  });
+
+  it("supports pi.sendUserMessage() when idle, mid-run (steer/followUp), and reports diagnostic when deliverAs is omitted mid-run", async () => {
+    const { faux, models, store } = createTestEnv();
+    const diagnostics: ExtensionDiagnostic[] = [];
+    const seenInputMeta: Array<{ text: string; source: string; streamingBehavior?: string }> = [];
+    const modelUserPrompts: string[] = [];
+    let sendFn!: (
+      content:
+        | string
+        | ({ type: "text"; text: string } | { type: "image"; data: string; mimeType: string })[],
+      options?: { deliverAs?: "steer" | "followUp" },
+    ) => void;
+
+    const ext: ExtensionFactory = (pi) => {
+      sendFn = (content, options) => pi.sendUserMessage(content, options);
+      pi.on("input", (event) => {
+        seenInputMeta.push({
+          text: event.text,
+          source: event.source,
+          ...(event.streamingBehavior !== undefined ? { streamingBehavior: event.streamingBehavior } : {}),
+        });
+        return { action: "continue" };
+      });
+      pi.registerTool(
+        defineTool({
+          name: "trigger_mid_run",
+          description: "Queues a followUp message and tests missing deliverAs error",
+          parameters: obj({}),
+          execute: async () => {
+            // Omitting deliverAs while running must report a diagnostic without throwing.
+            pi.sendUserMessage("missing deliverAs");
+            // Providing deliverAs queues a followUp turn.
+            pi.sendUserMessage("follow up from tool", { deliverAs: "followUp" });
+            return { content: [{ type: "text", text: "queued" }], details: {} };
+          },
+        }),
+      );
+    };
+
+    faux.setResponses([
+      // 1. Triggered by idle pi.sendUserMessage()
+      (context) => {
+        const lastUser = [...context.messages].reverse().find((m) => m.role === "user");
+        modelUserPrompts.push(
+          lastUser && Array.isArray(lastUser.content)
+            ? lastUser.content
+                .filter((b) => b.type === "text")
+                .map((b) => b.text)
+                .join("|")
+            : "",
+        );
+        return fauxAssistantMessage("Awake!");
+      },
+      // 2. Host prompt invokes tool -> queues followUp
+      fauxAssistantMessage(fauxToolCall("trigger_mid_run", {}, { id: "tc-send" }), { stopReason: "toolUse" }),
+      // 3. Tool result turn finishes -> agent drains followUp
+      fauxAssistantMessage("Tool done."),
+      // 4. Model responds to queued followUp
+      (context) => {
+        const lastUser = [...context.messages].reverse().find((m) => m.role === "user");
+        modelUserPrompts.push(
+          lastUser && Array.isArray(lastUser.content)
+            ? lastUser.content
+                .filter((b) => b.type === "text")
+                .map((b) => b.text)
+                .join("|")
+            : "",
+        );
+        return fauxAssistantMessage("Handled follow-up.");
+      },
+    ]);
+
+    const session = await createSession({
+      sessionId: "sess-send-user-msg",
+      models,
+      store,
+      model: { provider: "faux", modelId: "faux-1" },
+      extensions: [{ name: "sender-ext", factory: ext }],
+      onExtensionDiagnostic: (d) => diagnostics.push(d),
+    });
+
+    // Idle call starts a run asynchronously; wait for agent_end.
+    const idleRunDone = new Promise<void>((resolve) => {
+      const unsub = session.subscribe((event) => {
+        if (event.type === "agent_end") {
+          unsub();
+          resolve();
+        }
+      });
+    });
+    sendFn([
+      { type: "text", text: "background wake" },
+      { type: "image", data: "AQID", mimeType: "image/png" },
+    ]);
+    await idleRunDone;
+    // Wait a tick for commitFinalSnapshot to clear activeRun.
+    while (session.isRunning) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+
+    expect(modelUserPrompts[0]).toBe("background wake");
+    expect(seenInputMeta[0]).toEqual({ text: "background wake", source: "extension" });
+
+    // Now run a normal prompt whose tool calls pi.sendUserMessage() mid-run.
+    const res = await session.prompt("Run tool");
+    expect(res.status).toBe("idle");
+    expect(modelUserPrompts).toEqual(["background wake", "follow up from tool"]);
+    expect(seenInputMeta).toContainEqual({
+      text: "follow up from tool",
+      source: "extension",
+      streamingBehavior: "followUp",
+    });
+    expect(
+      diagnostics.some(
+        (d) =>
+          d.kind === "handler_error" && d.extensionName === "sender-ext" && d.event === "send_user_message",
+      ),
+    ).toBe(true);
   });
 });

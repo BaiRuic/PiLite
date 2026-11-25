@@ -92,6 +92,12 @@ export interface ExtensionCompactOptions {
   readonly onError?: (error: Error) => void;
 }
 
+/** Options for `pi.sendUserMessage()`. */
+export interface SendUserMessageOptions {
+  /** Delivery mode when a run is currently active: `"steer"` or `"followUp"`. */
+  readonly deliverAs?: "steer" | "followUp";
+}
+
 /** Metadata for a registered tool returned by `pi.getAllTools()`. */
 export interface ExtensionToolInfo {
   readonly name: string;
@@ -415,6 +421,11 @@ export interface ExtensionAPI {
   setThinkingLevel(level: ThinkingLevel): Promise<void>;
   getSessionName(): string | undefined;
   setSessionName(name: string | undefined): Promise<void>;
+  /**
+   * Send a user message to the session. Triggers a new prompt turn when idle,
+   * or queues via `steer` / `followUp` when a run is active (`options.deliverAs` required).
+   */
+  sendUserMessage(content: string | (TextContent | ImageContent)[], options?: SendUserMessageOptions): void;
   appendEntry<T = unknown>(customType: string, data?: T): CustomSessionEntry<T>;
   exec(command: string, args: string[], options?: ExtensionExecOptions): Promise<ExtensionExecResult>;
   readonly events: ExtensionEventBus;

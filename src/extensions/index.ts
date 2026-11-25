@@ -40,6 +40,7 @@ export {
   type InputSource,
   type ModelSelectEvent,
   type ModelSelectSource,
+  type SendUserMessageOptions,
   type SessionBeforeCompactEvent,
   type SessionBeforeCompactResult,
   type SessionCompactEvent,
