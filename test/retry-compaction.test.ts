@@ -402,8 +402,8 @@ describe("Auto-retry and context compaction", () => {
       tools: [lookupTool],
       extensions: [compactionExt],
       compaction: {
-        summarizer: async ({ instructions }) => {
-          observedInstructions = instructions;
+        summarizer: async ({ customInstructions }) => {
+          observedInstructions = customInstructions;
           return { summary: "Built-in summary with custom instructions" };
         },
       },

@@ -9,7 +9,9 @@ export {
   type CompactionSummarizerInput,
   type CompactionSummaryOutput,
   type CompactionTrigger,
+  calculateContextTokens,
   createCompactionSummaryMessage,
+  estimateContextUsageTokens,
   estimateMessageTokens,
   estimateTranscriptTokens,
   isSafeForkBoundary,
@@ -18,6 +20,7 @@ export {
 } from "./compaction.js";
 export {
   type AfterProviderResponseEvent,
+  type AgentSettledExtensionEvent,
   type BeforeAgentStartEvent,
   type BeforeAgentStartResult,
   type BeforeProviderHeadersEvent,

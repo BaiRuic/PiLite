@@ -13,6 +13,7 @@ import {
   type ExtensionFactory,
   ExtensionRunner,
   type ExtensionToolInfo,
+  estimateContextUsageTokens,
   InMemorySessionStore,
   openSession,
   type SessionStore,
@@ -425,7 +426,6 @@ describe("Headless Extension System", () => {
     let runPendingBefore = true;
     let runPendingAfter = false;
     let idleUsage: ContextUsage | undefined;
-    let compactBusyError: Error | undefined;
     let savedCtx!: ExtensionContext;
 
     let sessionRef: Awaited<ReturnType<typeof createSession>> | undefined;
@@ -449,14 +449,6 @@ describe("Headless Extension System", () => {
             runPendingBefore = ctx.hasPendingMessages();
             sessionRef?.steer("queued steering");
             runPendingAfter = ctx.hasPendingMessages();
-            await new Promise<void>((resolve) => {
-              ctx.compact({
-                onError: (err) => {
-                  compactBusyError = err;
-                  resolve();
-                },
-              });
-            });
             return { content: [{ type: "text", text: "probed" }], details: {} };
           },
         }),
@@ -478,8 +470,8 @@ describe("Headless Extension System", () => {
       compaction: {
         contextWindow: 1000,
         keepRecentTokens: 1,
-        summarizer: async ({ instructions }) => ({
-          summary: `Compact summary (${instructions ?? "none"})`,
+        summarizer: async ({ customInstructions }) => ({
+          summary: `Compact summary (${customInstructions ?? "none"})`,
         }),
       },
       extensions: [inspectExt],
@@ -498,7 +490,6 @@ describe("Headless Extension System", () => {
     expect(runSignal).toBeInstanceOf(AbortSignal);
     expect(runPendingBefore).toBe(false);
     expect(runPendingAfter).toBe(true);
-    expect(compactBusyError).toBeInstanceOf(Error);
 
     // After run completes, ctx.signal returns to undefined and ctx.compact() succeeds.
     expect(savedCtx.signal).toBeUndefined();
@@ -513,6 +504,8 @@ describe("Headless Extension System", () => {
     });
     expect(compactResult.compacted).toBe(true);
     expect(compactResult.summary).toBe("Compact summary (keep decisions)");
+    // Immediately after compaction (before any new assistant usage), getContextUsage returns null tokens/percent.
+    expect(savedCtx.getContextUsage()).toEqual({ tokens: null, contextWindow: 1000, percent: null });
   });
 
   it("supports tool_result structuredContent and usage overrides across main and nested tool calls", async () => {
@@ -659,6 +652,7 @@ describe("Headless Extension System", () => {
     runner.bind({
       sessionId: "sess-payload",
       getModel: () => model,
+      setModel: async () => true,
       getThinkingLevel: () => "off",
       setThinkingLevel: async () => undefined,
       getSessionName: () => undefined,
@@ -1059,5 +1053,289 @@ describe("Headless Extension System", () => {
           d.kind === "handler_error" && d.extensionName === "sender-ext" && d.event === "send_user_message",
       ),
     ).toBe(true);
+  });
+
+  it("emits agent_settled and defers pi.sendUserMessage() called inside agent_end and agent_settled", async () => {
+    const { faux, models, store } = createTestEnv();
+    const settledEvents: Array<{ aborted: boolean; isIdle: boolean }> = [];
+    const seenPrompts: string[] = [];
+    let sentFromEnd = false;
+    let sentFromSettled = false;
+
+    const ext: ExtensionFactory = (pi) => {
+      pi.on("agent_end", () => {
+        if (!sentFromEnd) {
+          sentFromEnd = true;
+          pi.sendUserMessage("from-agent-end");
+        }
+      });
+      pi.on("agent_settled", (event, ctx) => {
+        settledEvents.push({ aborted: event.aborted, isIdle: ctx.isIdle() });
+        if (!sentFromSettled && settledEvents.length === 2) {
+          sentFromSettled = true;
+          pi.sendUserMessage("from-agent-settled");
+        }
+      });
+    };
+
+    const recordUser =
+      (reply: string) => (ctx: { messages: readonly { role: string; content: unknown }[] }) => {
+        const last = [...ctx.messages].reverse().find((m) => m.role === "user");
+        seenPrompts.push(
+          last && Array.isArray(last.content) && last.content[0]?.type === "text" ? last.content[0].text : "",
+        );
+        return fauxAssistantMessage(reply);
+      };
+
+    faux.setResponses([recordUser("reply 1"), recordUser("reply 2"), recordUser("reply 3")]);
+
+    const session = await createSession({
+      sessionId: "sess-agent-settled",
+      models,
+      store,
+      model: { provider: "faux", modelId: "faux-1" },
+      extensions: [ext],
+    });
+
+    await session.prompt("initial");
+    expect(seenPrompts).toEqual(["initial", "from-agent-end", "from-agent-settled"]);
+    expect(settledEvents).toEqual([
+      { aborted: false, isIdle: true },
+      { aborted: false, isIdle: true },
+      { aborted: false, isIdle: true },
+    ]);
+  });
+
+  it("aborts an active run when ctx.compact() is triggered mid-run (aligned with pi-coding-agent)", async () => {
+    const { faux, models, store } = createTestEnv();
+    let resolveCompact!: (result: CompactionResult) => void;
+    const compactPromise = new Promise<CompactionResult>((resolve) => {
+      resolveCompact = resolve;
+    });
+
+    const ext: ExtensionFactory = (pi) => {
+      pi.registerTool(
+        defineTool({
+          name: "trigger_compact",
+          description: "Triggers fire-and-forget ctx.compact() mid-run",
+          parameters: obj({}),
+          execute: async (_id, _params, _signal, _onUpdate, ctx) => {
+            ctx.compact({
+              customInstructions: "mid-run abort compact",
+              onComplete: resolveCompact,
+            });
+            return { content: [{ type: "text", text: "triggered" }], details: {} };
+          },
+        }),
+      );
+    };
+
+    faux.setResponses([
+      fauxAssistantMessage("Earlier turn answer to ensure enough history to compact."),
+      fauxAssistantMessage(fauxToolCall("trigger_compact", {}, { id: "tc-cmp" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("Should not run because compact aborted the run."),
+    ]);
+
+    const session = await createSession({
+      sessionId: "sess-midrun-compact",
+      models,
+      store,
+      model: { provider: "faux", modelId: "faux-1" },
+      compaction: {
+        keepRecentTokens: 1,
+        summarizer: async ({ customInstructions }) => ({
+          summary: `Aborted & compacted (${customInstructions ?? "none"})`,
+        }),
+      },
+      extensions: [ext],
+    });
+
+    await session.prompt("Earlier turn question.");
+    const runResult = await session.prompt("Now trigger compact mid-run.");
+    const compactResult = await compactPromise;
+
+    expect(runResult.status).toBe("aborted");
+    expect(compactResult.compacted).toBe(true);
+    expect(compactResult.summary).toBe("Aborted & compacted (mid-run abort compact)");
+  });
+
+  it("computes ctx.getContextUsage() from real assistant usage + trailing estimate and returns null after compaction", async () => {
+    const { faux, models, store } = createTestEnv();
+    let savedCtx!: ExtensionContext;
+
+    // Pure unit check: real assistant usage + trailing message estimate.
+    const assistantWithUsage = fauxAssistantMessage("ok");
+    assistantWithUsage.usage = {
+      input: 320,
+      output: 80,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 400,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    };
+    const trailingUser = {
+      role: "user" as const,
+      content: [{ type: "text" as const, text: "12345678" }], // 8 chars => 2 tokens
+      timestamp: 2,
+    };
+    expect(estimateContextUsageTokens([assistantWithUsage, trailingUser])).toBe(402);
+
+    const ext: ExtensionFactory = (pi) => {
+      pi.on("session_start", (_event, ctx) => {
+        savedCtx = ctx;
+      });
+    };
+
+    faux.setResponses([
+      fauxAssistantMessage("First reply with non-zero faux usage."),
+      fauxAssistantMessage("Second reply before compaction."),
+      fauxAssistantMessage("Post-compaction reply."),
+    ]);
+
+    const session = await createSession({
+      sessionId: "sess-real-usage",
+      models,
+      store,
+      model: { provider: "faux", modelId: "faux-1" },
+      compaction: {
+        contextWindow: 1000,
+        keepRecentTokens: 1,
+        summarizer: async () => ({ summary: "Compact summary" }),
+      },
+      extensions: [ext],
+    });
+
+    await session.prompt("Hello");
+    await session.prompt("More context");
+    const lastBeforeCompact = [...session.getSnapshot().messages]
+      .reverse()
+      .find((m) => m.role === "assistant");
+    expect(lastBeforeCompact?.role).toBe("assistant");
+    const expectedBefore = lastBeforeCompact?.role === "assistant" ? lastBeforeCompact.usage.totalTokens : -1;
+    expect(expectedBefore).toBeGreaterThan(0);
+    expect(savedCtx.getContextUsage()).toEqual({
+      tokens: expectedBefore,
+      contextWindow: 1000,
+      percent: (expectedBefore / 1000) * 100,
+    });
+
+    const compacted = await session.compact({ keepRecentTokens: 1 });
+    expect(compacted.compacted).toBe(true);
+    expect(savedCtx.getContextUsage()).toEqual({ tokens: null, contextWindow: 1000, percent: null });
+
+    await session.prompt("After compaction");
+    const lastAfterCompact = [...session.getSnapshot().messages]
+      .reverse()
+      .find((m) => m.role === "assistant");
+    const expectedAfter = lastAfterCompact?.role === "assistant" ? lastAfterCompact.usage.totalTokens : -1;
+    expect(expectedAfter).toBeGreaterThan(0);
+    expect(savedCtx.getContextUsage()).toEqual({
+      tokens: expectedAfter,
+      contextWindow: 1000,
+      percent: (expectedAfter / 1000) * 100,
+    });
+  });
+
+  it("persists idle pi.appendEntry() calls from model_select, thinking_level_select, session_compact, and session_shutdown", async () => {
+    const faux = fauxProvider({ provider: "faux", models: [{ id: "faux-1" }, { id: "faux-2" }] });
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const store = new InMemorySessionStore();
+
+    const ext: ExtensionFactory = (pi) => {
+      pi.on("model_select", (event) => {
+        pi.appendEntry("audit.model", { to: event.model.id });
+      });
+      pi.on("thinking_level_select", (event) => {
+        pi.appendEntry("audit.thinking", { to: event.level });
+      });
+      pi.on("session_compact", () => {
+        pi.appendEntry("audit.compact", { ok: true });
+      });
+      pi.on("session_shutdown", () => {
+        pi.appendEntry("audit.shutdown", { closed: true });
+      });
+    };
+
+    faux.setResponses([fauxAssistantMessage("Turn 1"), fauxAssistantMessage("Turn 2")]);
+
+    const session = await createSession({
+      sessionId: "sess-idle-append",
+      models,
+      store,
+      model: { provider: "faux", modelId: "faux-1" },
+      compaction: {
+        keepRecentTokens: 1,
+        summarizer: async () => ({ summary: "Summary" }),
+      },
+      extensions: [ext],
+    });
+
+    await session.prompt("Q1");
+    await session.prompt("Q2");
+    await session.setModel({ provider: "faux", modelId: "faux-2" });
+    await session.setThinkingLevel("medium");
+    await session.compact({ keepRecentTokens: 1 });
+    await session.close();
+
+    const reopened = await openSession({
+      sessionId: "sess-idle-append",
+      models,
+      store,
+    });
+    expect(reopened.getSnapshot().customEntries?.map((e) => e.customType)).toEqual([
+      "audit.model",
+      "audit.thinking",
+      "audit.compact",
+      "audit.shutdown",
+    ]);
+  });
+
+  it("supports pi.setModel(), session_start fork reason, and before_agent_start images", async () => {
+    const faux = fauxProvider({ provider: "faux", models: [{ id: "faux-1" }, { id: "faux-2" }] });
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const store = new InMemorySessionStore();
+
+    const startReasons: string[] = [];
+    let seenImagesCount = 0;
+    let apiSetModel!: (
+      target: { provider: string; modelId: string } | { provider: string; id: string },
+    ) => Promise<boolean>;
+
+    const ext: ExtensionFactory = (pi) => {
+      apiSetModel = (target) => pi.setModel(target as never);
+      pi.on("session_start", (event) => {
+        startReasons.push(event.reason);
+      });
+      pi.on("before_agent_start", (event) => {
+        seenImagesCount = event.images?.length ?? 0;
+      });
+    };
+
+    faux.setResponses([fauxAssistantMessage("Image received.")]);
+
+    const session = await createSession({
+      sessionId: "sess-polish",
+      models,
+      store,
+      model: { provider: "faux", modelId: "faux-1" },
+      extensions: [ext],
+    });
+
+    expect(await apiSetModel({ provider: "faux", modelId: "missing" })).toBe(false);
+    expect(await apiSetModel({ provider: "faux", modelId: "faux-2" })).toBe(true);
+    expect(session.model).toEqual({ provider: "faux", modelId: "faux-2" });
+
+    // Also accepts full Model<Api> objects directly.
+    const model1 = models.getModel("faux", "faux-1")!;
+    expect(await apiSetModel(model1)).toBe(true);
+    expect(session.model).toEqual({ provider: "faux", modelId: "faux-1" });
+
+    await session.prompt("Inspect this image", [{ type: "image", data: "AQID", mimeType: "image/png" }]);
+    expect(seenImagesCount).toBe(1);
+
+    await session.fork({ sessionId: "sess-polish-fork" });
+    expect(startReasons).toEqual(["create", "fork"]);
   });
 });

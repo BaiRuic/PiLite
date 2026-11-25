@@ -174,16 +174,24 @@ export class ModelHub {
     return this.activeModels.logout(providerId, options);
   }
 
-  /** Register or replace a base provider at runtime and recompute local overlays immediately. */
+  /** Register or replace a base provider at runtime and recompute its local overlay without clearing other dynamic caches. */
   setProvider(provider: Provider<Api>): void {
     this.baseProviders.set(provider.id, provider);
-    this.activeModels = this.buildModelsInstance();
+    const composed = this.composeProvider(provider.id);
+    if (composed) {
+      this.activeModels.setProvider(composed);
+    }
   }
 
-  /** Remove a base provider at runtime. */
+  /** Remove a base provider at runtime without clearing other dynamic provider caches. */
   removeProvider(providerId: string): void {
     this.baseProviders.delete(providerId);
-    this.activeModels = this.buildModelsInstance();
+    const composed = this.composeProvider(providerId);
+    if (composed) {
+      this.activeModels.setProvider(composed);
+    } else {
+      this.activeModels.deleteProvider(providerId);
+    }
   }
 
   getProviders(): readonly Provider<Api>[] {
@@ -338,6 +346,18 @@ export class ModelHub {
     return result;
   }
 
+  private composeProvider(providerId: string): Provider<Api> | undefined {
+    const base = this.baseProviders.get(providerId);
+    const local = this.localConfig.providers[providerId];
+    return local
+      ? composeLocalProvider(providerId, base, local, {
+          configResolver: this.configResolver,
+          fetch: this.fetchImpl,
+          apiStreams: this.apiStreams,
+        })
+      : base;
+  }
+
   private buildModelsInstance(): MutableModels {
     const models = createModels({
       ...(this.credentials ? { credentials: this.credentials } : {}),
@@ -352,15 +372,7 @@ export class ModelHub {
     ]);
 
     for (const providerId of allIds) {
-      const base = this.baseProviders.get(providerId);
-      const local = this.localConfig.providers[providerId];
-      const composed = local
-        ? composeLocalProvider(providerId, base, local, {
-            configResolver: this.configResolver,
-            fetch: this.fetchImpl,
-            apiStreams: this.apiStreams,
-          })
-        : base;
+      const composed = this.composeProvider(providerId);
       if (composed) {
         models.setProvider(composed);
       }

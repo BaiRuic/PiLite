@@ -23,7 +23,7 @@ import type {
   CompactionResult,
   CompactionTrigger,
 } from "../compaction.js";
-import type { CustomSessionEntry, SessionSnapshot } from "../types.js";
+import type { CustomSessionEntry, ModelRef, SessionSnapshot } from "../types.js";
 
 export interface ExtensionUIDialogOptions {
   readonly signal?: AbortSignal;
@@ -159,11 +159,17 @@ export function defineTool<TParameters extends Record<string, any> = Record<stri
 
 export interface SessionStartExtensionEvent {
   readonly type: "session_start";
-  readonly reason: "create" | "open";
+  readonly reason: "create" | "open" | "fork";
 }
 
 export interface SessionShutdownExtensionEvent {
   readonly type: "session_shutdown";
+}
+
+/** Fired after an agent run has completely settled (committed to store and returned to idle). */
+export interface AgentSettledExtensionEvent {
+  readonly type: "agent_settled";
+  readonly aborted: boolean;
 }
 
 /** Fired before context compaction (can cancel, adjust instructions, or provide a custom summary). */
@@ -220,6 +226,7 @@ export interface SessionCompactFailedEvent {
 export interface BeforeAgentStartEvent {
   readonly type: "before_agent_start";
   readonly prompt: string;
+  readonly images?: ImageContent[];
   readonly systemPrompt: string;
 }
 
@@ -343,6 +350,7 @@ type AgentEventByType = {
 export interface ExtensionEventMap extends AgentEventByType {
   session_start: SessionStartExtensionEvent;
   session_shutdown: SessionShutdownExtensionEvent;
+  agent_settled: AgentSettledExtensionEvent;
   session_before_compact: SessionBeforeCompactEvent;
   session_compact: SessionCompactEvent;
   session_compact_failed: SessionCompactFailedEvent;
@@ -361,6 +369,7 @@ export interface ExtensionEventMap extends AgentEventByType {
 export interface ExtensionEventResultMap {
   session_start: void;
   session_shutdown: void;
+  agent_settled: void;
   session_before_compact: SessionBeforeCompactResult | void;
   session_compact: void;
   session_compact_failed: void;
@@ -417,6 +426,8 @@ export interface ExtensionAPI {
   getActiveTools(): string[];
   setActiveTools(toolNames: string[]): void;
   getAllTools(): ExtensionToolInfo[];
+  /** Switch the session's active model. Returns `false` if unavailable or unauthenticated. */
+  setModel(model: ModelRef | Model<Api>): Promise<boolean>;
   getThinkingLevel(): ThinkingLevel;
   setThinkingLevel(level: ThinkingLevel): Promise<void>;
   getSessionName(): string | undefined;

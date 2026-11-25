@@ -40,7 +40,7 @@ export function createDefaultCompactionExtension(
       const output = options.summarizer
         ? await options.summarizer({
             messages: structuredClone(event.preparation.messagesToSummarize),
-            instructions: event.customInstructions,
+            customInstructions: event.customInstructions,
             model,
             signal: event.signal,
           })
@@ -48,7 +48,7 @@ export function createDefaultCompactionExtension(
             models: options.getModels(),
             model,
             messages: event.preparation.messagesToSummarize,
-            instructions: event.customInstructions,
+            customInstructions: event.customInstructions,
             identity: options.identity,
             signal: event.signal,
             onFailedUsage: (usage) => options.onFailedUsage?.(usage, model),

@@ -6,6 +6,7 @@ export {
 export { type ExtensionHostBindings, ExtensionRunner } from "./runner.js";
 export {
   type AfterProviderResponseEvent,
+  type AgentSettledExtensionEvent,
   type BeforeAgentStartEvent,
   type BeforeAgentStartResult,
   type BeforeProviderHeadersEvent,

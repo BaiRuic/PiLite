@@ -68,7 +68,7 @@ export interface CompactionPreparation {
 
 export interface CompactionSummarizerInput {
   readonly messages: readonly AgentMessage[];
-  readonly instructions?: string;
+  readonly customInstructions?: string;
   readonly model: Model<Api>;
   readonly signal?: AbortSignal;
 }
@@ -94,7 +94,7 @@ export interface CompactionOptions {
 }
 
 export interface CompactionRequestOptions {
-  readonly instructions?: string;
+  readonly customInstructions?: string;
   readonly keepRecentTokens?: number;
 }
 
@@ -177,6 +177,75 @@ export function estimateMessageTokens(message: AgentMessage): number {
     chars += JSON.stringify(message).length;
   }
   return Math.max(1, Math.ceil(chars / CHARS_PER_TOKEN_ESTIMATE));
+}
+
+/**
+ * Calculate total context tokens from a model `Usage` record.
+ * Matches `pi-coding-agent`: prefers `totalTokens`, falling back to the component sum.
+ */
+export function calculateContextTokens(usage: Usage): number {
+  return usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+}
+
+/**
+ * Estimate active context token usage using the latest valid post-compaction
+ * `AssistantMessage.usage` plus character-based estimation for trailing messages
+ * (aligned with `pi-coding-agent`'s `getContextUsage()`).
+ *
+ * Returns `null` when a compaction checkpoint exists and no valid assistant response
+ * has occurred after it yet (because pre-compaction usage reflects the old context).
+ */
+export function estimateContextUsageTokens(
+  contextMessages: readonly AgentMessage[],
+  compactions?: readonly CompactionCheckpoint[],
+): number | null {
+  const latestCompaction =
+    compactions && compactions.length > 0 ? compactions[compactions.length - 1] : undefined;
+
+  let minValidAssistantIndex = 0;
+  if (latestCompaction) {
+    // Projected layout: [systemBaseline?, summaryMessage, ...keptPreCompaction, ...postCompaction]
+    const hasSystemBaseline = contextMessages[0]?.role === "system";
+    const summaryIndex = hasSystemBaseline ? 1 : 0;
+    const preCompactionKeptCount = Math.max(
+      0,
+      latestCompaction.compactedAtIndex - latestCompaction.firstKeptIndex,
+    );
+    minValidAssistantIndex = summaryIndex + 1 + preCompactionKeptCount;
+  }
+
+  let lastValidAssistantIndex = -1;
+  let lastValidUsageTokens = 0;
+  for (let i = contextMessages.length - 1; i >= minValidAssistantIndex; i -= 1) {
+    const message = contextMessages[i];
+    if (
+      message?.role === "assistant" &&
+      message.stopReason !== "aborted" &&
+      message.stopReason !== "error" &&
+      message.usage
+    ) {
+      const tokens = calculateContextTokens(message.usage);
+      if (tokens > 0) {
+        lastValidAssistantIndex = i;
+        lastValidUsageTokens = tokens;
+        break;
+      }
+    }
+  }
+
+  if (latestCompaction && lastValidAssistantIndex === -1) {
+    return null;
+  }
+
+  if (lastValidAssistantIndex === -1) {
+    return estimateTranscriptTokens(contextMessages);
+  }
+
+  let trailingTokens = 0;
+  for (let i = lastValidAssistantIndex + 1; i < contextMessages.length; i += 1) {
+    trailingTokens += estimateMessageTokens(contextMessages[i]!);
+  }
+  return lastValidUsageTokens + trailingTokens;
 }
 
 export function estimateTranscriptTokens(messages: readonly AgentMessage[]): number {
@@ -332,15 +401,15 @@ export async function defaultSummarizeMessages(params: {
   readonly models: Models;
   readonly model: Model<Api>;
   readonly messages: readonly AgentMessage[];
-  readonly instructions?: string;
+  readonly customInstructions?: string;
   readonly identity?: ClientIdentity;
   readonly signal?: AbortSignal;
   /** Invoked when the summarization response errored/aborted after incurring usage. */
   readonly onFailedUsage?: (usage: Usage) => void;
 }): Promise<CompactionSummaryOutput> {
   const transcriptText = renderMessagesForSummary(params.messages);
-  const promptText = params.instructions
-    ? `Additional focus instructions: ${params.instructions}\n\nConversation to summarize:\n\n${transcriptText}`
+  const promptText = params.customInstructions
+    ? `Additional focus instructions: ${params.customInstructions}\n\nConversation to summarize:\n\n${transcriptText}`
     : `Conversation to summarize:\n\n${transcriptText}`;
 
   const context: Context = {

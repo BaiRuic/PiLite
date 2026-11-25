@@ -30,6 +30,7 @@ import {
   type CompactionRequestOptions,
   type CompactionResult,
   type CompactionTrigger,
+  estimateContextUsageTokens,
   estimateTranscriptTokens,
   isSafeForkBoundary,
   planCompaction,
@@ -259,6 +260,20 @@ function extractPromptText(messages: readonly AgentMessage[]): string {
   return parts.join("\n");
 }
 
+function extractPromptImages(messages: readonly AgentMessage[]): ImageContent[] | undefined {
+  const images: ImageContent[] = [];
+  for (const message of messages) {
+    if (message.role === "user" && Array.isArray(message.content)) {
+      for (const block of message.content) {
+        if (block.type === "image") {
+          images.push(structuredClone(block));
+        }
+      }
+    }
+  }
+  return images.length > 0 ? images : undefined;
+}
+
 function isEmptyAbortedAssistantMessage(message: AgentMessage): boolean {
   if (message.role !== "assistant" || message.stopReason !== "aborted") {
     return false;
@@ -351,6 +366,9 @@ export class HarnessSession {
   private customEntries: CustomSessionEntry[];
   private activeRun: ActiveRun | undefined;
   private activeRunSystemPromptOverride: string | undefined;
+  private isEmittingAgentEnd = false;
+  private isEmittingAgentSettled = false;
+  private readonly deferredSettledActions: Array<() => Promise<void>> = [];
   private invalidated = false;
   private closed = false;
   private completedTurnsInRun = 0;
@@ -464,6 +482,38 @@ export class HarnessSession {
     this.extensions.bind({
       sessionId: snapshot.sessionId,
       getModel: () => this.resolvedModel,
+      setModel: async (target) => {
+        const ref: ModelRef =
+          "modelId" in target
+            ? { provider: target.provider, modelId: target.modelId }
+            : { provider: target.provider, modelId: target.id };
+        const models = this.getModels();
+        const resolved = models.getModel(ref.provider, ref.modelId);
+        if (!resolved) return false;
+        const auth = await models.checkAuth(ref.provider);
+        if (!auth) return false;
+
+        if (this.activeRun) {
+          const previousModel = this.resolvedModel;
+          this.agent.state.model = resolved;
+          this.committedSnapshot = {
+            ...this.committedSnapshot,
+            model: { provider: ref.provider, modelId: ref.modelId },
+          };
+          if (previousModel?.provider !== resolved.provider || previousModel?.id !== resolved.id) {
+            await this.extensions.emitModelSelect({
+              type: "model_select",
+              model: resolved,
+              previousModel,
+              source: "set",
+            });
+          }
+          return true;
+        }
+
+        await this.setModel(ref);
+        return true;
+      },
       getThinkingLevel: () => this.thinkingLevel,
       setThinkingLevel: async (level) => {
         if (this.activeRun) {
@@ -517,17 +567,17 @@ export class HarnessSession {
       getContextUsage: () => {
         const contextWindow = this.effectiveContextWindow();
         if (contextWindow <= 0) return undefined;
-        const tokens = estimateTranscriptTokens(this.agent.state.messages);
+        const tokens = estimateContextUsageTokens(this.agent.state.messages, this.compactionCheckpoints);
         return {
           tokens,
           contextWindow,
-          percent: (tokens / contextWindow) * 100,
+          percent: tokens !== null ? (tokens / contextWindow) * 100 : null,
         };
       },
       compact: (compactOptions) => {
         void this.compact(
           compactOptions?.customInstructions !== undefined
-            ? { instructions: compactOptions.customInstructions }
+            ? { customInstructions: compactOptions.customInstructions }
             : {},
         ).then(
           (result) => {
@@ -632,9 +682,18 @@ export class HarnessSession {
         }
         await this.persistMessageEnd(event.message);
       }
-      await this.extensions.emitAgentEvent(event);
-      for (const listener of [...this.listeners]) {
-        await listener(event, signal);
+      if (event.type === "agent_end") {
+        this.isEmittingAgentEnd = true;
+      }
+      try {
+        await this.extensions.emitAgentEvent(event);
+        for (const listener of [...this.listeners]) {
+          await listener(event, signal);
+        }
+      } finally {
+        if (event.type === "agent_end") {
+          this.isEmittingAgentEnd = false;
+        }
       }
     });
   }
@@ -890,12 +949,14 @@ export class HarnessSession {
     this.agent.state.model = resolved;
     this.committedSnapshot = structuredClone(updated);
     if (previousModel?.provider !== resolved.provider || previousModel?.id !== resolved.id) {
+      const entriesBefore = this.customEntries.length;
       await this.extensions.emitModelSelect({
         type: "model_select",
         model: resolved,
         previousModel,
         source: "set",
       });
+      await this.flushCustomEntriesIfChanged(entriesBefore);
     }
   }
 
@@ -913,11 +974,13 @@ export class HarnessSession {
     this.agent.state.thinkingLevel = level;
     this.committedSnapshot = structuredClone(updated);
     if (level !== previousLevel) {
+      const entriesBefore = this.customEntries.length;
       await this.extensions.emitThinkingLevelSelect({
         type: "thinking_level_select",
         level,
         previousLevel,
       });
+      await this.flushCustomEntriesIfChanged(entriesBefore);
     }
   }
 
@@ -1042,15 +1105,24 @@ export class HarnessSession {
       extensions: forkedExtensions,
       options: forkedOptions,
     });
-    await forked.finalizeStartup("create");
+    await forked.finalizeStartup("fork");
     return forked;
   }
 
   /**
    * Manually record a non-destructive compaction checkpoint over older messages while
    * preserving full transcript history and never splitting tool-call / tool-result pairs.
+   *
+   * Aligned with `pi-coding-agent`: if a run is currently active, aborts it first before
+   * compacting (manual compaction never retries or continues the interrupted turn).
    */
   async compact(options: CompactionRequestOptions = {}): Promise<CompactionResult> {
+    if (this.invalidated) {
+      this.assertReadyForRun();
+    }
+    if (this.activeRun) {
+      await this.abort();
+    }
     this.assertReadyForRun();
     this.agent.state.model = resolveModelOrThrow(this.getModels(), this.committedSnapshot.model);
     const keepRecentTokens =
@@ -1062,7 +1134,7 @@ export class HarnessSession {
       keepRecentTokens,
       trigger: "manual",
       willRetry: false,
-      instructions: options.instructions,
+      customInstructions: options.customInstructions,
     });
     if (!outcome.compacted) {
       return outcome.result;
@@ -1080,6 +1152,7 @@ export class HarnessSession {
     this.compactionCheckpoints = nextCompactions;
     this.agent.state.messages = structuredClone(outcome.nextContextMessages);
     this.committedSnapshot = structuredClone(updated);
+    const entriesBefore = this.customEntries.length;
     await this.extensions.emitSessionCompact({
       type: "session_compact",
       checkpoint: structuredClone(outcome.checkpoint),
@@ -1087,6 +1160,7 @@ export class HarnessSession {
       reason: "manual",
       willRetry: false,
     });
+    await this.flushCustomEntriesIfChanged(entriesBefore);
     return outcome.result;
   }
 
@@ -1146,11 +1220,13 @@ export class HarnessSession {
     await current.promise.catch(() => undefined);
   }
 
-  /** Notify extensions of session shutdown. Idempotent. */
+  /** Notify extensions of session shutdown and persist any entries appended during shutdown. Idempotent. */
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    const entriesBefore = this.customEntries.length;
     await this.extensions.emitSessionShutdown();
+    await this.flushCustomEntriesIfChanged(entriesBefore);
   }
 
   /** Send a new prompt and commit the run result atomically on completion. */
@@ -1190,10 +1266,12 @@ export class HarnessSession {
     const userMessages = normalizePromptInput(effectiveInput, effectiveImages, this.now);
     const systemPatch = buildSystemPromptPatch(this.agent.state.messages, this.desiredSystemPrompt, this.now);
     const pendingMessages: AgentMessage[] = systemPatch ? [systemPatch, ...userMessages] : userMessages;
+    const promptImages = extractPromptImages(userMessages);
 
     return this.startRun({
       kind: "prompt",
       promptText: extractPromptText(userMessages),
+      ...(promptImages !== undefined ? { promptImages } : {}),
       pendingMessages,
       preRunFullMessages: [
         ...structuredClone(this.committedSnapshot.messages),
@@ -1211,6 +1289,21 @@ export class HarnessSession {
     options?: SendUserMessageOptions,
   ): void | Promise<void> {
     const { text, images } = normalizeExtensionUserContent(content);
+
+    // Aligned with `pi-coding-agent`: defer prompts issued during `agent_end` / `agent_settled`
+    // so they execute cleanly right after the current run finishes settling.
+    if (this.isEmittingAgentSettled || this.isEmittingAgentEnd) {
+      return new Promise<void>((resolve, reject) => {
+        this.deferredSettledActions.push(async () => {
+          try {
+            await this.promptWithSource(text, images, "extension");
+            resolve();
+          } catch (error) {
+            reject(error);
+          }
+        });
+      });
+    }
 
     if (this.isRunning) {
       const deliverAs = options?.deliverAs;
@@ -1277,9 +1370,12 @@ export class HarnessSession {
       : candidateFullMessages;
     const preRunContextMessages = projectContextMessages(preRunFullMessages, clampedCompactions);
 
+    const promptImages = extractPromptImages(candidateContextMessages.slice(-1));
+
     return this.startRun({
       kind: "continue",
       promptText: extractPromptText(candidateContextMessages.slice(-1)),
+      ...(promptImages !== undefined ? { promptImages } : {}),
       preRunFullMessages: structuredClone(preRunFullMessages),
       preRunContextMessages: structuredClone(preRunContextMessages),
       compactions: clampedCompactions,
@@ -1329,7 +1425,7 @@ export class HarnessSession {
     readonly keepRecentTokens: number;
     readonly trigger: CompactionTrigger;
     readonly willRetry: boolean;
-    readonly instructions: string | undefined;
+    readonly customInstructions: string | undefined;
     readonly signal?: AbortSignal;
   }): Promise<
     | { readonly compacted: false; readonly result: CompactionResult }
@@ -1370,7 +1466,7 @@ export class HarnessSession {
       type: "session_before_compact",
       preparation,
       messages: structuredClone([...params.fullMessages]),
-      ...(params.instructions !== undefined ? { customInstructions: params.instructions } : {}),
+      ...(params.customInstructions !== undefined ? { customInstructions: params.customInstructions } : {}),
       reason: params.trigger,
       willRetry: params.willRetry,
       ...(params.signal !== undefined ? { signal: params.signal } : {}),
@@ -1519,17 +1615,38 @@ export class HarnessSession {
     }
   }
 
-  private async finalizeStartup(reason: "create" | "open"): Promise<void> {
+  private async flushCustomEntriesIfChanged(entriesBefore: number): Promise<void> {
+    if (this.customEntries.length <= entriesBefore || this.invalidated || this.activeRun) {
+      return;
+    }
+    const updated = this.buildSnapshot({
+      messages: this.committedSnapshot.messages,
+      status: this.committedSnapshot.status,
+      lastError: this.committedSnapshot.lastError,
+    });
+    await this.store.save(this.sessionId, updated);
+    this.committedSnapshot = structuredClone(updated);
+  }
+
+  private async finalizeStartup(reason: "create" | "open" | "fork"): Promise<void> {
     const entriesBefore = this.customEntries.length;
     await this.extensions.emitSessionStart(reason);
-    if (this.customEntries.length > entriesBefore) {
-      const updated = this.buildSnapshot({
-        messages: this.committedSnapshot.messages,
-        status: this.committedSnapshot.status,
-        lastError: this.committedSnapshot.lastError,
-      });
-      await this.store.save(this.sessionId, updated);
-      this.committedSnapshot = structuredClone(updated);
+    await this.flushCustomEntriesIfChanged(entriesBefore);
+  }
+
+  private async emitAgentSettled(aborted: boolean): Promise<void> {
+    this.isEmittingAgentSettled = true;
+    const entriesBefore = this.customEntries.length;
+    try {
+      await this.extensions.emitAgentSettled(aborted);
+    } finally {
+      this.isEmittingAgentSettled = false;
+    }
+    await this.flushCustomEntriesIfChanged(entriesBefore);
+
+    const deferred = this.deferredSettledActions.splice(0);
+    for (const action of deferred) {
+      await action();
     }
   }
 
@@ -1569,6 +1686,7 @@ export class HarnessSession {
       | {
           kind: "prompt";
           promptText: string;
+          promptImages?: ImageContent[];
           pendingMessages: AgentMessage[];
           preRunFullMessages: AgentMessage[];
           preRunContextMessages: AgentMessage[];
@@ -1576,6 +1694,7 @@ export class HarnessSession {
       | {
           kind: "continue";
           promptText: string;
+          promptImages?: ImageContent[];
           preRunFullMessages: AgentMessage[];
           preRunContextMessages: AgentMessage[];
           compactions: CompactionCheckpoint[];
@@ -1593,15 +1712,30 @@ export class HarnessSession {
     this.activeRun = runHandle;
 
     const promise = (async (): Promise<SessionRunResult> => {
+      let result: SessionRunResult | undefined;
+      let runSucceeded = false;
       try {
-        return await this.executeRun(plan, runHandle);
+        result = await this.executeRun(plan, runHandle);
+        runSucceeded = true;
       } finally {
         this.agent.clearAllQueues();
         this.activeRunSystemPromptOverride = undefined;
         if (this.activeRun === runHandle) {
           this.activeRun = undefined;
         }
+        if (!runSucceeded || this.invalidated) {
+          this.deferredSettledActions.length = 0;
+        }
       }
+
+      if (runSucceeded && result) {
+        if (!this.invalidated) {
+          await this.emitAgentSettled(result.status === "aborted");
+        }
+        return result;
+      }
+
+      return result!;
     })();
 
     runHandle.promise = promise;
@@ -1622,6 +1756,7 @@ export class HarnessSession {
       | {
           kind: "prompt";
           promptText: string;
+          promptImages?: ImageContent[];
           pendingMessages: AgentMessage[];
           preRunFullMessages: AgentMessage[];
           preRunContextMessages: AgentMessage[];
@@ -1629,6 +1764,7 @@ export class HarnessSession {
       | {
           kind: "continue";
           promptText: string;
+          promptImages?: ImageContent[];
           preRunFullMessages: AgentMessage[];
           preRunContextMessages: AgentMessage[];
           compactions: CompactionCheckpoint[];
@@ -1662,7 +1798,7 @@ export class HarnessSession {
           keepRecentTokens,
           trigger: "threshold",
           willRetry: false,
-          instructions: undefined,
+          customInstructions: undefined,
           signal: runHandle.abortController.signal,
         });
         if (compacted.compacted) {
@@ -1689,6 +1825,7 @@ export class HarnessSession {
     const beforeStart = await this.extensions.emitBeforeAgentStart({
       type: "before_agent_start",
       prompt: activePlan.promptText,
+      ...(activePlan.promptImages !== undefined ? { images: activePlan.promptImages } : {}),
       systemPrompt: this.systemPrompt,
     });
     if (beforeStart?.systemPrompt !== undefined) {
@@ -1781,7 +1918,7 @@ export class HarnessSession {
           keepRecentTokens,
           trigger: "overflow",
           willRetry: true,
-          instructions: undefined,
+          customInstructions: undefined,
           signal: runHandle.abortController.signal,
         });
         if (compacted.compacted && !runHandle.abortRequested) {
@@ -1899,6 +2036,10 @@ export class HarnessSession {
   private rollbackAndInvalidate(rollbackSnapshot: SessionSnapshot): void {
     this.compactionCheckpoints = structuredClone(rollbackSnapshot.compactions ?? []);
     this.agent.state.messages = projectContextMessages(rollbackSnapshot.messages, this.compactionCheckpoints);
+    this.agent.state.model = this.getModels().getModel(
+      rollbackSnapshot.model.provider,
+      rollbackSnapshot.model.modelId,
+    ) as Model<Api>;
     this.agent.state.thinkingLevel = rollbackSnapshot.thinkingLevel ?? "off";
     this.customEntries = structuredClone(rollbackSnapshot.customEntries ?? []);
     this.committedSnapshot = structuredClone(rollbackSnapshot);

@@ -8,7 +8,7 @@ import type {
   ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import type { Api, ImageContent, Model, ProviderHeaders, TextContent } from "@earendil-works/pi-ai";
-import type { CustomSessionEntry, SessionSnapshot } from "../types.js";
+import type { CustomSessionEntry, ModelRef, SessionSnapshot } from "../types.js";
 import { BUILTIN_COMPACTION_EXTENSION_NAME } from "./default-compaction.js";
 import type {
   BeforeAgentStartEvent,
@@ -49,6 +49,7 @@ import type {
 const SUPPORTED_EVENTS = new Set<string>([
   "session_start",
   "session_shutdown",
+  "agent_settled",
   "session_before_compact",
   "session_compact",
   "session_compact_failed",
@@ -82,6 +83,7 @@ type RegisteredHandler = {
 export interface ExtensionHostBindings {
   readonly sessionId: string;
   getModel(): Model<Api> | undefined;
+  setModel(model: ModelRef | Model<Api>): Promise<boolean>;
   getThinkingLevel(): ThinkingLevel;
   setThinkingLevel(level: ThinkingLevel): Promise<void>;
   getSessionName(): string | undefined;
@@ -265,12 +267,16 @@ export class ExtensionRunner {
     return (this.handlers.get(event)?.length ?? 0) > 0;
   }
 
-  async emitSessionStart(reason: "create" | "open"): Promise<void> {
+  async emitSessionStart(reason: "create" | "open" | "fork"): Promise<void> {
     await this.emitNotification("session_start", { type: "session_start", reason });
   }
 
   async emitSessionShutdown(): Promise<void> {
     await this.emitNotification("session_shutdown", { type: "session_shutdown" });
+  }
+
+  async emitAgentSettled(aborted: boolean): Promise<void> {
+    await this.emitNotification("agent_settled", { type: "agent_settled", aborted });
   }
 
   async emitSessionBeforeCompact(event: SessionBeforeCompactEvent): Promise<
@@ -356,7 +362,12 @@ export class ExtensionRunner {
     for (const handler of [...list]) {
       try {
         const result = (await handler.fn(
-          { type: "before_agent_start", prompt: event.prompt, systemPrompt: currentPrompt },
+          {
+            type: "before_agent_start",
+            prompt: event.prompt,
+            ...(event.images !== undefined ? { images: event.images } : {}),
+            systemPrompt: currentPrompt,
+          },
           ctx,
         )) as BeforeAgentStartResult | undefined;
         if (result?.systemPrompt !== undefined) {
@@ -667,6 +678,7 @@ export class ExtensionRunner {
       getActiveTools: () => this.getActiveToolNames(),
       setActiveTools: (toolNames: string[]) => this.setActiveToolNames(toolNames),
       getAllTools: () => this.getAllTools(),
+      setModel: (model: ModelRef | Model<Api>) => this.requireBindings().setModel(model),
       getThinkingLevel: () => this.requireBindings().getThinkingLevel(),
       setThinkingLevel: (level: ThinkingLevel) => this.requireBindings().setThinkingLevel(level),
       getSessionName: () => this.requireBindings().getSessionName(),

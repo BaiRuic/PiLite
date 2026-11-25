@@ -365,4 +365,31 @@ describe("ModelHub: OAuth login, custom JWT backend, local sources, and hot-swap
       HarnessError,
     );
   });
+
+  it("preserves refreshed dynamic provider models when setProvider/removeProvider mutates another provider", async () => {
+    const dynamicBackend = createApiBackendProvider({
+      id: "corp-dynamic",
+      baseUrl: "https://corp.example.com/v1",
+      apiKey: "tok",
+      fetch: async () =>
+        new Response(JSON.stringify({ data: [{ id: "corp-model-1" }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    });
+    const extraFaux = fauxProvider({ provider: "extra-faux", models: [{ id: "extra-1" }] });
+
+    const hub = createModelHub({ providers: [dynamicBackend] });
+    await hub.refresh();
+    expect(hub.getModel("corp-dynamic", "corp-model-1")).toBeDefined();
+
+    // Adding and removing an unrelated provider must not wipe corp-dynamic's refreshed catalog.
+    hub.setProvider(extraFaux.provider);
+    expect(hub.getModel("extra-faux", "extra-1")).toBeDefined();
+    expect(hub.getModel("corp-dynamic", "corp-model-1")).toBeDefined();
+
+    hub.removeProvider("extra-faux");
+    expect(hub.getModel("extra-faux", "extra-1")).toBeUndefined();
+    expect(hub.getModel("corp-dynamic", "corp-model-1")).toBeDefined();
+  });
 });
