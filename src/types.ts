@@ -12,6 +12,7 @@ import type {
   ExtensionRegistration,
   ExtensionUIAdapter,
 } from "./extensions/types.js";
+import type { CompactionOptions } from "./compaction.js";
 
 export const SESSION_SNAPSHOT_VERSION = 1 as const;
 
@@ -93,6 +94,57 @@ export interface SessionRunResult {
   readonly snapshot: SessionSnapshot;
 }
 
+export interface RetryEvent {
+  readonly attempt: number;
+  readonly maxRetries: number;
+  readonly delayMs: number;
+  readonly errorMessage: string;
+}
+
+export interface RetryOptions {
+  /** Maximum retry attempts for transient provider errors. Defaults to `3` when `retry` is provided. */
+  readonly maxRetries?: number;
+  /** Base exponential backoff delay in ms. Defaults to `2000`. */
+  readonly baseDelayMs?: number;
+  /** Maximum backoff delay in ms. Defaults to `60000`. */
+  readonly maxDelayMs?: number;
+  /** Optional observer invoked before each retry wait. */
+  readonly onRetry?: (event: RetryEvent) => void;
+  /** Custom sleep implementation (useful for deterministic tests). */
+  readonly sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+}
+
+export interface SessionStats {
+  readonly sessionId: string;
+  readonly userMessages: number;
+  readonly assistantMessages: number;
+  readonly toolCalls: number;
+  readonly toolResults: number;
+  readonly totalMessages: number;
+  readonly tokens: {
+    readonly input: number;
+    readonly output: number;
+    readonly cacheRead: number;
+    readonly cacheWrite: number;
+    readonly total: number;
+  };
+  readonly cost: {
+    readonly input: number;
+    readonly output: number;
+    readonly cacheRead: number;
+    readonly cacheWrite: number;
+    readonly total: number;
+  };
+}
+
+export interface ForkSessionOptions {
+  readonly sessionId?: string;
+  /** Optional exclusive message index to fork at; defaults to full current history. */
+  readonly atMessageIndex?: number;
+  readonly title?: string;
+  readonly generateId?: () => string;
+}
+
 export interface BaseSessionOptions {
   readonly models: Models;
   readonly store: SessionStore;
@@ -109,12 +161,17 @@ export interface BaseSessionOptions {
   readonly identity?: ClientIdentity;
   /** Optional upper bound on tool-calling turns within a single run. */
   readonly maxTurns?: number;
+  /** Optional automatic retry policy for transient provider errors. */
+  readonly retry?: RetryOptions;
+  /** Optional context compaction settings (threshold & overflow recovery). */
+  readonly compaction?: CompactionOptions;
   readonly now?: () => number;
 }
 
 export interface CreateSessionOptions extends BaseSessionOptions {
   readonly sessionId?: string;
   readonly model: ModelRef;
+  readonly title?: string;
   readonly generateId?: () => string;
 }
 

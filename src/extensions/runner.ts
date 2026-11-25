@@ -58,7 +58,7 @@ type RegisteredHandler = {
 
 export interface ExtensionHostBindings {
   readonly sessionId: string;
-  readonly model: Model<Api>;
+  getModel(): Model<Api>;
   readonly ui?: ExtensionUIAdapter;
   readonly exec?: ExtensionExecFn;
   readonly onDiagnostic?: (diagnostic: ExtensionDiagnostic) => void;
@@ -468,7 +468,7 @@ export class ExtensionRunner {
     const { hasUI, ui } = createUIContext(bindings.ui);
     return {
       sessionId: bindings.sessionId,
-      model: bindings.model,
+      model: bindings.getModel(),
       hasUI,
       ui,
       getSystemPrompt: () => bindings.getSystemPrompt(),

@@ -1,8 +1,16 @@
 import { randomUUID } from "node:crypto";
-import { Agent, type AgentEvent, type AgentMessage } from "@earendil-works/pi-agent-core";
+import {
+  Agent,
+  type AgentEvent,
+  type AgentMessage,
+  type ThinkingLevel,
+} from "@earendil-works/pi-agent-core";
 import {
   contentText,
   getCurrentSystemMessage,
+  isContextOverflow,
+  isRetryableAssistantError,
+  retryDelayMs,
   type Api,
   type AssistantMessage,
   type ClientIdentity,
@@ -12,6 +20,15 @@ import {
   type SystemMessage,
   type TextContent,
 } from "@earendil-works/pi-ai";
+import {
+  defaultSummarizeMessages,
+  estimateTranscriptTokens,
+  isSafeForkBoundary,
+  planCompaction,
+  type CompactionOptions,
+  type CompactionRequestOptions,
+  type CompactionResult,
+} from "./compaction.js";
 import { ExtensionRunner } from "./extensions/runner.js";
 import { buildSystemPromptPatch, createInitialTranscript } from "./system-prompt.js";
 import {
@@ -20,26 +37,79 @@ import {
   type BaseSessionOptions,
   type CreateSessionOptions,
   type CustomSessionEntry,
+  type ForkSessionOptions,
   type ModelRef,
   type OpenSessionOptions,
+  type RetryOptions,
   type SessionEventListener,
   type SessionRunResult,
   type SessionSnapshot,
+  type SessionStats,
   type SessionStore,
   type SessionTerminalStatus,
 } from "./types.js";
 
 const DEFAULT_HARNESS_IDENTITY: ClientIdentity = { attribution: null };
+const DEFAULT_RETRY_MAX_RETRIES = 3;
+const DEFAULT_RETRY_BASE_DELAY_MS = 2_000;
+const DEFAULT_RETRY_MAX_DELAY_MS = 60_000;
+const DEFAULT_COMPACTION_RESERVE_TOKENS = 16_384;
+const DEFAULT_COMPACTION_KEEP_RECENT_TOKENS = 20_000;
 
 interface ActiveRun {
   promise: Promise<SessionRunResult>;
   abortRequested: boolean;
+  abortController: AbortController;
 }
 
 function validateMaxTurns(maxTurns: number | undefined): void {
   if (maxTurns === undefined) return;
   if (!Number.isSafeInteger(maxTurns) || maxTurns < 1) {
     throw new HarnessError("INVALID_OPTIONS", `maxTurns must be a positive safe integer, got: ${String(maxTurns)}`);
+  }
+}
+
+function validateRetryOptions(retry: RetryOptions | undefined): void {
+  if (!retry) return;
+  if (retry.maxRetries !== undefined && (!Number.isSafeInteger(retry.maxRetries) || retry.maxRetries < 0)) {
+    throw new HarnessError(
+      "INVALID_OPTIONS",
+      `retry.maxRetries must be a non-negative integer, got: ${String(retry.maxRetries)}`,
+    );
+  }
+  if (retry.baseDelayMs !== undefined && (!Number.isFinite(retry.baseDelayMs) || retry.baseDelayMs < 0)) {
+    throw new HarnessError(
+      "INVALID_OPTIONS",
+      `retry.baseDelayMs must be a non-negative finite number, got: ${String(retry.baseDelayMs)}`,
+    );
+  }
+  if (retry.maxDelayMs !== undefined && (!Number.isFinite(retry.maxDelayMs) || retry.maxDelayMs < 0)) {
+    throw new HarnessError(
+      "INVALID_OPTIONS",
+      `retry.maxDelayMs must be a non-negative finite number, got: ${String(retry.maxDelayMs)}`,
+    );
+  }
+}
+
+function validateCompactionOptions(compaction: CompactionOptions | undefined): void {
+  if (!compaction) return;
+  if (
+    compaction.reserveTokens !== undefined &&
+    (!Number.isSafeInteger(compaction.reserveTokens) || compaction.reserveTokens < 0)
+  ) {
+    throw new HarnessError(
+      "INVALID_OPTIONS",
+      `compaction.reserveTokens must be a non-negative integer, got: ${String(compaction.reserveTokens)}`,
+    );
+  }
+  if (
+    compaction.keepRecentTokens !== undefined &&
+    (!Number.isSafeInteger(compaction.keepRecentTokens) || compaction.keepRecentTokens < 0)
+  ) {
+    throw new HarnessError(
+      "INVALID_OPTIONS",
+      `compaction.keepRecentTokens must be a non-negative integer, got: ${String(compaction.keepRecentTokens)}`,
+    );
   }
 }
 
@@ -132,14 +202,36 @@ function insertBeforeTrailingNonSystem(messages: readonly AgentMessage[], patch:
   return [...messages.slice(0, insertIndex), patch, ...messages.slice(insertIndex)];
 }
 
+function defaultSleepWithAbort(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted || ms <= 0) {
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 export class HarnessSession {
   readonly sessionId: string;
 
+  private readonly models: Models;
   private readonly store: SessionStore;
   private readonly agent: Agent;
   private readonly extensions: ExtensionRunner;
+  private readonly baseOptions: BaseSessionOptions;
   private readonly now: () => number;
   private readonly maxTurns: number | undefined;
+  private readonly retry: RetryOptions | undefined;
+  private readonly compaction: CompactionOptions | undefined;
+  private readonly identity: ClientIdentity;
   private readonly desiredSystemPrompt: string | undefined;
   private readonly listeners = new Set<SessionEventListener>();
 
@@ -155,15 +247,21 @@ export class HarnessSession {
   private constructor(params: {
     snapshot: SessionSnapshot;
     model: Model<Api>;
+    thinkingLevel: ThinkingLevel;
     extensions: ExtensionRunner;
     options: BaseSessionOptions;
   }) {
-    const { snapshot, model, extensions, options } = params;
+    const { snapshot, model, thinkingLevel, extensions, options } = params;
     this.sessionId = snapshot.sessionId;
+    this.models = options.models;
     this.store = options.store;
     this.extensions = extensions;
+    this.baseOptions = options;
     this.now = options.now ?? (() => Date.now());
     this.maxTurns = options.maxTurns;
+    this.retry = options.retry;
+    this.compaction = options.compaction;
+    this.identity = options.identity ?? DEFAULT_HARNESS_IDENTITY;
     this.desiredSystemPrompt = options.systemPrompt;
     this.committedSnapshot = structuredClone(snapshot);
     this.customEntries = structuredClone(snapshot.customEntries ?? []);
@@ -172,13 +270,13 @@ export class HarnessSession {
       initialState: {
         systemPrompt: "",
         model,
-        thinkingLevel: options.thinkingLevel ?? "off",
+        thinkingLevel,
         tools: extensions.getActiveAgentTools(),
         messages: structuredClone(snapshot.messages),
       },
       streamFn: options.models.streamSimple.bind(options.models),
       sessionId: snapshot.sessionId,
-      identity: options.identity ?? DEFAULT_HARNESS_IDENTITY,
+      identity: this.identity,
       thinkingBudgets: options.thinkingBudgets,
       toolExecution: options.toolExecution,
       transformContext: async (messages) => {
@@ -236,7 +334,7 @@ export class HarnessSession {
 
     this.extensions.bind({
       sessionId: snapshot.sessionId,
-      model,
+      getModel: () => this.agent.state.model,
       ui: options.ui,
       exec: options.exec,
       onDiagnostic: options.onExtensionDiagnostic,
@@ -283,6 +381,8 @@ export class HarnessSession {
   /** @internal */
   static async create(options: CreateSessionOptions): Promise<HarnessSession> {
     validateMaxTurns(options.maxTurns);
+    validateRetryOptions(options.retry);
+    validateCompactionOptions(options.compaction);
     const resolvedModel = resolveModelOrThrow(options.models, options.model);
     const now = options.now ?? (() => Date.now());
     const sessionId = options.sessionId ?? options.generateId?.() ?? randomUUID();
@@ -302,6 +402,8 @@ export class HarnessSession {
       onDiagnostic: options.onExtensionDiagnostic,
     });
 
+    const timestamp = now();
+    const thinkingLevel = options.thinkingLevel ?? "off";
     const initialMessages = createInitialTranscript(
       options.systemPrompt,
       extensions.getActiveAgentTools(),
@@ -311,9 +413,12 @@ export class HarnessSession {
       version: SESSION_SNAPSHOT_VERSION,
       sessionId,
       model: { provider: options.model.provider, modelId: options.model.modelId },
+      thinkingLevel,
+      ...(options.title !== undefined ? { title: options.title } : {}),
       messages: initialMessages,
       status: "idle",
-      updatedAt: now(),
+      createdAt: timestamp,
+      updatedAt: timestamp,
     };
 
     await options.store.save(sessionId, snapshot);
@@ -321,6 +426,7 @@ export class HarnessSession {
     const session = new HarnessSession({
       snapshot,
       model: resolvedModel,
+      thinkingLevel,
       extensions,
       options,
     });
@@ -331,6 +437,8 @@ export class HarnessSession {
   /** @internal */
   static async open(options: OpenSessionOptions): Promise<HarnessSession> {
     validateMaxTurns(options.maxTurns);
+    validateRetryOptions(options.retry);
+    validateCompactionOptions(options.compaction);
     const now = options.now ?? (() => Date.now());
     const loaded = await options.store.load(options.sessionId);
     if (loaded === null) {
@@ -344,6 +452,7 @@ export class HarnessSession {
     }
 
     const resolvedModel = resolveModelOrThrow(options.models, loaded.model);
+    const thinkingLevel = options.thinkingLevel ?? loaded.thinkingLevel ?? "off";
 
     const extensions = await ExtensionRunner.load({
       extensions: options.extensions ?? [],
@@ -357,11 +466,15 @@ export class HarnessSession {
         version: SESSION_SNAPSHOT_VERSION,
         sessionId: loaded.sessionId,
         model: { provider: loaded.model.provider, modelId: loaded.model.modelId },
+        ...(loaded.thinkingLevel !== undefined ? { thinkingLevel: loaded.thinkingLevel } : {}),
+        ...(loaded.title !== undefined ? { title: loaded.title } : {}),
+        ...(loaded.parentSessionId !== undefined ? { parentSessionId: loaded.parentSessionId } : {}),
         messages: structuredClone(loaded.messages),
         ...(loaded.customEntries && loaded.customEntries.length > 0
           ? { customEntries: structuredClone(loaded.customEntries) }
           : {}),
         status: "interrupted",
+        ...(loaded.createdAt !== undefined ? { createdAt: loaded.createdAt } : {}),
         updatedAt: now(),
       };
       await options.store.save(loaded.sessionId, recovered);
@@ -371,6 +484,7 @@ export class HarnessSession {
     const session = new HarnessSession({
       snapshot,
       model: resolvedModel,
+      thinkingLevel,
       extensions,
       options,
     });
@@ -381,6 +495,24 @@ export class HarnessSession {
   /** Latest committed snapshot (defensive copy). */
   getSnapshot(): SessionSnapshot {
     return structuredClone(this.committedSnapshot);
+  }
+
+  /** Current persisted model reference. */
+  get model(): ModelRef {
+    return {
+      provider: this.committedSnapshot.model.provider,
+      modelId: this.committedSnapshot.model.modelId,
+    };
+  }
+
+  /** Current thinking level. */
+  get thinkingLevel(): ThinkingLevel {
+    return this.agent.state.thinkingLevel;
+  }
+
+  /** Current session display title, if set. */
+  get title(): string | undefined {
+    return this.committedSnapshot.title;
   }
 
   /** Effective system prompt that will apply on the next request. */
@@ -398,6 +530,276 @@ export class HarnessSession {
     return this.extensions.getActiveToolNames();
   }
 
+  /** Aggregate message counts, tokens, and costs from committed history. */
+  getStats(): SessionStats {
+    let userMessages = 0;
+    let assistantMessages = 0;
+    let toolCalls = 0;
+    let toolResults = 0;
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let cacheReadTokens = 0;
+    let cacheWriteTokens = 0;
+    let totalTokens = 0;
+    let inputCost = 0;
+    let outputCost = 0;
+    let cacheReadCost = 0;
+    let cacheWriteCost = 0;
+    let totalCost = 0;
+
+    const addUsage = (usage: AssistantMessage["usage"] | undefined) => {
+      if (!usage) return;
+      inputTokens += usage.input;
+      outputTokens += usage.output;
+      cacheReadTokens += usage.cacheRead;
+      cacheWriteTokens += usage.cacheWrite;
+      totalTokens += usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+      inputCost += usage.cost.input;
+      outputCost += usage.cost.output;
+      cacheReadCost += usage.cost.cacheRead;
+      cacheWriteCost += usage.cost.cacheWrite;
+      totalCost += usage.cost.total;
+    };
+
+    for (const message of this.committedSnapshot.messages) {
+      if (message.role === "user") {
+        userMessages += 1;
+      } else if (message.role === "assistant") {
+        assistantMessages += 1;
+        for (const block of message.content) {
+          if (block.type === "toolCall") toolCalls += 1;
+        }
+        addUsage(message.usage);
+      } else if (message.role === "toolResult") {
+        toolResults += 1;
+        addUsage(message.usage);
+      }
+    }
+
+    return {
+      sessionId: this.sessionId,
+      userMessages,
+      assistantMessages,
+      toolCalls,
+      toolResults,
+      totalMessages: this.committedSnapshot.messages.length,
+      tokens: {
+        input: inputTokens,
+        output: outputTokens,
+        cacheRead: cacheReadTokens,
+        cacheWrite: cacheWriteTokens,
+        total: totalTokens,
+      },
+      cost: {
+        input: inputCost,
+        output: outputCost,
+        cacheRead: cacheReadCost,
+        cacheWrite: cacheWriteCost,
+        total: totalCost,
+      },
+    };
+  }
+
+  /** Switch the session's model while idle and persist the updated `ModelRef`. */
+  async setModel(modelRef: ModelRef): Promise<void> {
+    this.assertReadyForRun();
+    const resolved = resolveModelOrThrow(this.models, modelRef);
+    const updated = this.buildSnapshot({
+      model: { provider: modelRef.provider, modelId: modelRef.modelId },
+      messages: this.committedSnapshot.messages,
+      status: this.committedSnapshot.status,
+      lastError: this.committedSnapshot.lastError,
+    });
+    await this.store.save(this.sessionId, updated);
+    this.agent.state.model = resolved;
+    this.committedSnapshot = structuredClone(updated);
+  }
+
+  /** Change the session's thinking level while idle and persist it. */
+  async setThinkingLevel(level: ThinkingLevel): Promise<void> {
+    this.assertReadyForRun();
+    const updated = this.buildSnapshot({
+      thinkingLevel: level,
+      messages: this.committedSnapshot.messages,
+      status: this.committedSnapshot.status,
+      lastError: this.committedSnapshot.lastError,
+    });
+    await this.store.save(this.sessionId, updated);
+    this.agent.state.thinkingLevel = level;
+    this.committedSnapshot = structuredClone(updated);
+  }
+
+  /** Set or clear the session's display title while idle and persist it. */
+  async setTitle(title: string | undefined): Promise<void> {
+    this.assertReadyForRun();
+    const updated = this.buildSnapshot({
+      title,
+      messages: this.committedSnapshot.messages,
+      status: this.committedSnapshot.status,
+      lastError: this.committedSnapshot.lastError,
+    });
+    await this.store.save(this.sessionId, updated);
+    this.committedSnapshot = structuredClone(updated);
+  }
+
+  /**
+   * Reset conversation history while preserving model, thinking level, title,
+   * and current system/tool baseline. Optionally starts the fresh transcript
+   * with a handoff note.
+   */
+  async reset(handoffText?: string): Promise<SessionSnapshot> {
+    this.assertReadyForRun();
+    const baseline = getCurrentSystemMessage(this.agent.state.messages);
+    const nextMessages: AgentMessage[] = baseline ? [structuredClone(baseline)] : [];
+
+    const patch = buildSystemPromptPatch(nextMessages, this.desiredSystemPrompt, this.now);
+    if (patch) {
+      nextMessages.push(patch);
+    }
+
+    if (handoffText !== undefined && handoffText.length > 0) {
+      nextMessages.push({
+        role: "user",
+        content: [{ type: "text", text: handoffText }],
+        timestamp: this.now(),
+      });
+    }
+
+    const updated = this.buildSnapshot({
+      messages: nextMessages,
+      status: "idle",
+      lastError: undefined,
+    });
+    await this.store.save(this.sessionId, updated);
+    this.agent.state.messages = structuredClone(nextMessages);
+    this.committedSnapshot = structuredClone(updated);
+    return this.getSnapshot();
+  }
+
+  /**
+   * Fork this session into a new independent session with its own `sessionId`
+   * (and therefore its own provider cache / session affinity).
+   */
+  async fork(options: ForkSessionOptions = {}): Promise<HarnessSession> {
+    this.assertReadyForRun();
+    const currentMessages = this.committedSnapshot.messages;
+    const cutIndex = options.atMessageIndex ?? currentMessages.length;
+
+    if (!Number.isSafeInteger(cutIndex) || cutIndex < 0 || cutIndex > currentMessages.length) {
+      throw new HarnessError(
+        "INVALID_OPTIONS",
+        `atMessageIndex must be an integer between 0 and ${currentMessages.length}, got: ${String(cutIndex)}`,
+      );
+    }
+    if (!isSafeForkBoundary(currentMessages, cutIndex)) {
+      throw new HarnessError(
+        "INVALID_OPTIONS",
+        `Cannot fork at message index ${cutIndex}: boundary splits a toolCall from its toolResult.`,
+      );
+    }
+
+    const newSessionId = options.sessionId ?? options.generateId?.() ?? randomUUID();
+    if (!newSessionId.trim()) {
+      throw new HarnessError("INVALID_OPTIONS", "sessionId must be a non-empty string.");
+    }
+    const existing = await this.store.load(newSessionId);
+    if (existing !== null) {
+      throw new HarnessError("SESSION_EXISTS", `Session "${newSessionId}" already exists.`);
+    }
+
+    const resolvedModel = resolveModelOrThrow(this.models, this.committedSnapshot.model);
+    const forkedExtensions = await ExtensionRunner.load({
+      extensions: this.baseOptions.extensions ?? [],
+      baseTools: this.baseOptions.tools ?? [],
+      onDiagnostic: this.baseOptions.onExtensionDiagnostic,
+    });
+    forkedExtensions.setActiveToolNames(this.getActiveTools());
+
+    const timestamp = this.now();
+    const title = options.title !== undefined ? options.title : this.committedSnapshot.title;
+    const forkedSnapshot: SessionSnapshot = {
+      version: SESSION_SNAPSHOT_VERSION,
+      sessionId: newSessionId,
+      model: {
+        provider: this.committedSnapshot.model.provider,
+        modelId: this.committedSnapshot.model.modelId,
+      },
+      thinkingLevel: this.thinkingLevel,
+      ...(title !== undefined ? { title } : {}),
+      parentSessionId: this.sessionId,
+      messages: structuredClone(currentMessages.slice(0, cutIndex)),
+      ...(this.customEntries.length > 0 ? { customEntries: structuredClone(this.customEntries) } : {}),
+      status: "idle",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+
+    await this.store.save(newSessionId, forkedSnapshot);
+
+    const forkedOptions: BaseSessionOptions = {
+      ...this.baseOptions,
+      // Keep the forked transcript's system prompt baseline unless explicitly overridden later.
+      systemPrompt: undefined,
+    };
+    const forked = new HarnessSession({
+      snapshot: forkedSnapshot,
+      model: resolvedModel,
+      thinkingLevel: this.thinkingLevel,
+      extensions: forkedExtensions,
+      options: forkedOptions,
+    });
+    await forked.finalizeStartup("create");
+    return forked;
+  }
+
+  /**
+   * Manually compact older conversation messages into a summary while preserving
+   * recent turns and never splitting tool-call / tool-result pairs.
+   */
+  async compact(options: CompactionRequestOptions = {}): Promise<CompactionResult> {
+    this.assertReadyForRun();
+    const keepRecentTokens =
+      options.keepRecentTokens ??
+      this.compaction?.keepRecentTokens ??
+      DEFAULT_COMPACTION_KEEP_RECENT_TOKENS;
+
+    const outcome = await this.runCompactionOnMessages(
+      this.agent.state.messages,
+      keepRecentTokens,
+      options.instructions,
+      undefined,
+    );
+    if (!outcome.compacted) {
+      return outcome.result;
+    }
+
+    const entry: CustomSessionEntry = {
+      id: randomUUID(),
+      customType: "harness.compaction",
+      data: {
+        summary: outcome.result.summary,
+        compactedMessages: outcome.result.compactedMessages,
+        keptMessages: outcome.result.keptMessages,
+        tokensBefore: outcome.result.tokensBefore,
+        tokensAfter: outcome.result.tokensAfter,
+      },
+      timestamp: this.now(),
+    };
+    const nextCustomEntries = [...structuredClone(this.customEntries), entry];
+    const updated = this.buildSnapshot({
+      messages: outcome.nextMessages,
+      customEntries: nextCustomEntries,
+      status: this.committedSnapshot.status,
+      lastError: this.committedSnapshot.lastError,
+    });
+
+    await this.store.save(this.sessionId, updated);
+    this.agent.state.messages = structuredClone(outcome.nextMessages);
+    this.customEntries = nextCustomEntries;
+    this.committedSnapshot = structuredClone(updated);
+    return outcome.result;
+  }
+
   /** Subscribe to `pi-agent-core` events for runs driven by this session. */
   subscribe(listener: SessionEventListener): () => void {
     this.listeners.add(listener);
@@ -407,8 +809,8 @@ export class HarnessSession {
   }
 
   /**
-   * Abort the active run and wait until both `pi-agent-core` and final snapshot
-   * persistence have settled.
+   * Abort the active run (including any retry backoff wait) and wait until both
+   * `pi-agent-core` and final snapshot persistence have settled.
    */
   async abort(): Promise<void> {
     const current = this.activeRun;
@@ -416,6 +818,7 @@ export class HarnessSession {
       return;
     }
     current.abortRequested = true;
+    current.abortController.abort();
     this.agent.abort();
     await current.promise.catch(() => undefined);
   }
@@ -475,15 +878,116 @@ export class HarnessSession {
     });
   }
 
+  private buildSnapshot(overrides: {
+    model?: ModelRef;
+    thinkingLevel?: ThinkingLevel;
+    title?: string | undefined;
+    messages: AgentMessage[];
+    customEntries?: CustomSessionEntry[];
+    status: SessionSnapshot["status"];
+    lastError?: string | undefined;
+  }): SessionSnapshot {
+    const model = overrides.model ?? this.committedSnapshot.model;
+    const thinkingLevel = overrides.thinkingLevel ?? this.agent.state.thinkingLevel;
+    const title = "title" in overrides ? overrides.title : this.committedSnapshot.title;
+    const customEntries = overrides.customEntries ?? this.customEntries;
+    const lastError = overrides.lastError;
+    const createdAt = this.committedSnapshot.createdAt ?? this.committedSnapshot.updatedAt;
+
+    return {
+      version: SESSION_SNAPSHOT_VERSION,
+      sessionId: this.sessionId,
+      model: { provider: model.provider, modelId: model.modelId },
+      thinkingLevel,
+      ...(title !== undefined ? { title } : {}),
+      ...(this.committedSnapshot.parentSessionId !== undefined
+        ? { parentSessionId: this.committedSnapshot.parentSessionId }
+        : {}),
+      messages: structuredClone(overrides.messages),
+      ...(customEntries.length > 0 ? { customEntries: structuredClone(customEntries) } : {}),
+      status: overrides.status,
+      ...(lastError !== undefined ? { lastError } : {}),
+      createdAt,
+      updatedAt: this.now(),
+    };
+  }
+
+  private async runCompactionOnMessages(
+    messages: readonly AgentMessage[],
+    keepRecentTokens: number,
+    instructions: string | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<
+    | { readonly compacted: false; readonly result: CompactionResult }
+    | { readonly compacted: true; readonly nextMessages: AgentMessage[]; readonly result: CompactionResult }
+  > {
+    const tokensBefore = estimateTranscriptTokens(messages);
+    const plan = planCompaction(messages, keepRecentTokens);
+    if (!plan) {
+      return {
+        compacted: false,
+        result: {
+          compacted: false,
+          compactedMessages: 0,
+          keptMessages: messages.filter((m) => m.role !== "system").length,
+          tokensBefore,
+          tokensAfter: tokensBefore,
+        },
+      };
+    }
+
+    const summary = this.compaction?.summarizer
+      ? await this.compaction.summarizer({
+          messages: structuredClone(plan.toSummarize),
+          instructions,
+          model: this.agent.state.model,
+          signal,
+        })
+      : await defaultSummarizeMessages({
+          models: this.models,
+          model: this.agent.state.model,
+          messages: plan.toSummarize,
+          instructions,
+          identity: this.identity,
+          signal,
+        });
+
+    const summaryMessage: AgentMessage = {
+      role: "user",
+      content: [{ type: "text", text: `<conversation_summary>\n${summary}\n</conversation_summary>` }],
+      timestamp: this.now(),
+    };
+
+    const nextMessages: AgentMessage[] = [
+      ...(plan.systemBaseline ? [structuredClone(plan.systemBaseline)] : []),
+      summaryMessage,
+      ...structuredClone(plan.kept),
+    ];
+    const tokensAfter = estimateTranscriptTokens(nextMessages);
+
+    return {
+      compacted: true,
+      nextMessages,
+      result: {
+        compacted: true,
+        summary,
+        compactedMessages: plan.toSummarize.length,
+        keptMessages: plan.kept.length,
+        tokensBefore,
+        tokensAfter,
+      },
+    };
+  }
+
   private async finalizeStartup(reason: "create" | "open"): Promise<void> {
     const entriesBefore = this.customEntries.length;
     await this.extensions.emitSessionStart(reason);
     if (this.customEntries.length > entriesBefore) {
-      const updated: SessionSnapshot = {
-        ...this.committedSnapshot,
-        customEntries: structuredClone(this.customEntries),
-        updatedAt: this.now(),
-      };
+      const updated = this.buildSnapshot({
+        messages: this.committedSnapshot.messages,
+        status: this.committedSnapshot.status,
+        lastError: this.committedSnapshot.lastError,
+      });
       await this.store.save(this.sessionId, updated);
       this.committedSnapshot = structuredClone(updated);
     }
@@ -509,6 +1013,7 @@ export class HarnessSession {
     const runHandle: ActiveRun = {
       promise: Promise.resolve() as unknown as Promise<SessionRunResult>,
       abortRequested: false,
+      abortController: new AbortController(),
     };
     this.activeRun = runHandle;
 
@@ -527,6 +1032,10 @@ export class HarnessSession {
     return promise;
   }
 
+  private effectiveContextWindow(): number {
+    return this.compaction?.contextWindow ?? this.agent.state.model.contextWindow ?? 0;
+  }
+
   private async executeRun(
     plan:
       | { kind: "prompt"; promptText: string; pendingMessages: AgentMessage[]; preRunMessages: AgentMessage[] }
@@ -534,53 +1043,176 @@ export class HarnessSession {
     runHandle: ActiveRun,
   ): Promise<SessionRunResult> {
     const beforeCustomEntries = structuredClone(this.customEntries);
+    const beforeMessages = structuredClone(this.agent.state.messages);
+
+    // Optional threshold auto-compaction before starting the run.
+    let activePlan = plan;
+    if (this.compaction?.enabled === true) {
+      const contextWindow = this.effectiveContextWindow();
+      const reserveTokens = this.compaction.reserveTokens ?? DEFAULT_COMPACTION_RESERVE_TOKENS;
+      const keepRecentTokens = this.compaction.keepRecentTokens ?? DEFAULT_COMPACTION_KEEP_RECENT_TOKENS;
+      if (contextWindow > 0 && estimateTranscriptTokens(activePlan.preRunMessages) > contextWindow - reserveTokens) {
+        const compacted = await this.runCompactionOnMessages(
+          this.agent.state.messages,
+          keepRecentTokens,
+          undefined,
+          runHandle.abortController.signal,
+        );
+        if (compacted.compacted) {
+          this.agent.state.messages = structuredClone(compacted.nextMessages);
+          this.customEntries.push({
+            id: randomUUID(),
+            customType: "harness.compaction",
+            data: {
+              trigger: "threshold",
+              summary: compacted.result.summary,
+              compactedMessages: compacted.result.compactedMessages,
+              keptMessages: compacted.result.keptMessages,
+              tokensBefore: compacted.result.tokensBefore,
+              tokensAfter: compacted.result.tokensAfter,
+            },
+            timestamp: this.now(),
+          });
+          if (activePlan.kind === "prompt") {
+            activePlan = {
+              ...activePlan,
+              preRunMessages: [
+                ...structuredClone(compacted.nextMessages),
+                ...structuredClone(activePlan.pendingMessages),
+              ],
+            };
+          } else {
+            activePlan = {
+              ...activePlan,
+              preRunMessages: structuredClone(compacted.nextMessages),
+            };
+          }
+        }
+      }
+    }
+
     const beforeStart = await this.extensions.emitBeforeAgentStart({
       type: "before_agent_start",
-      prompt: plan.promptText,
+      prompt: activePlan.promptText,
       systemPrompt: this.systemPrompt,
     });
     if (beforeStart?.systemPrompt !== undefined) {
       this.activeRunSystemPromptOverride = beforeStart.systemPrompt;
     }
 
-    const preRunSnapshot: SessionSnapshot = {
-      version: SESSION_SNAPSHOT_VERSION,
-      sessionId: this.sessionId,
-      model: { provider: this.committedSnapshot.model.provider, modelId: this.committedSnapshot.model.modelId },
-      messages: structuredClone(plan.preRunMessages),
-      ...(this.customEntries.length > 0 ? { customEntries: structuredClone(this.customEntries) } : {}),
+    const preRunSnapshot = this.buildSnapshot({
+      messages: activePlan.preRunMessages,
       status: "running",
-      updatedAt: this.now(),
-    };
+      lastError: undefined,
+    });
 
     // Persist user input + running state before starting execution;
     // if pre-run persistence fails, do not start the run or mutate agent state.
     try {
       await this.store.save(this.sessionId, preRunSnapshot);
     } catch (error) {
+      this.agent.state.messages = beforeMessages;
       this.customEntries = beforeCustomEntries;
       throw error;
     }
     this.committedSnapshot = structuredClone(preRunSnapshot);
-
-    const baselineMessageCount = this.agent.state.messages.length;
-    this.completedTurnsInRun = 0;
-    this.maxTurnsReachedInRun = false;
 
     if (runHandle.abortRequested) {
       this.agent.state.messages = structuredClone(preRunSnapshot.messages);
       return this.commitFinalSnapshot(preRunSnapshot, preRunSnapshot.messages, "aborted", undefined);
     }
 
-    if (plan.kind === "prompt") {
-      await this.agent.prompt(plan.pendingMessages);
-    } else {
-      this.agent.state.messages = structuredClone(plan.preRunMessages);
-      await this.agent.continue();
+    const maxRetries = this.retry ? (this.retry.maxRetries ?? DEFAULT_RETRY_MAX_RETRIES) : 0;
+    const baseDelayMs = this.retry?.baseDelayMs ?? DEFAULT_RETRY_BASE_DELAY_MS;
+    const maxDelayMs = this.retry?.maxDelayMs ?? DEFAULT_RETRY_MAX_DELAY_MS;
+    const sleep = this.retry?.sleep ?? defaultSleepWithAbort;
+
+    let retryAttempt = 0;
+    let overflowRecoveryAttempted = false;
+    let lastAssistant: AssistantMessage | undefined;
+    let firstInvocation = true;
+
+    while (true) {
+      const attemptBaseline = this.agent.state.messages.length;
+      this.completedTurnsInRun = 0;
+      this.maxTurnsReachedInRun = false;
+
+      if (firstInvocation && activePlan.kind === "prompt") {
+        firstInvocation = false;
+        await this.agent.prompt(activePlan.pendingMessages);
+      } else {
+        if (firstInvocation) {
+          firstInvocation = false;
+          this.agent.state.messages = structuredClone(activePlan.preRunMessages);
+        }
+        await this.agent.continue();
+      }
+
+      const producedMessages = this.agent.state.messages.slice(attemptBaseline);
+      lastAssistant = findLastAssistantMessage(producedMessages);
+
+      if (runHandle.abortRequested || this.maxTurnsReachedInRun || lastAssistant?.stopReason !== "error") {
+        break;
+      }
+
+      // Overflow recovery via compaction (at most once per run).
+      if (
+        this.compaction?.enabled === true &&
+        !overflowRecoveryAttempted &&
+        isContextOverflow(lastAssistant, this.effectiveContextWindow() || undefined)
+      ) {
+        overflowRecoveryAttempted = true;
+        const stripped = stripTrailingFailedAssistants(this.agent.state.messages);
+        const keepRecentTokens = this.compaction.keepRecentTokens ?? DEFAULT_COMPACTION_KEEP_RECENT_TOKENS;
+        const compacted = await this.runCompactionOnMessages(
+          stripped,
+          keepRecentTokens,
+          undefined,
+          runHandle.abortController.signal,
+        );
+        if (compacted.compacted && !runHandle.abortRequested) {
+          this.agent.state.messages = structuredClone(compacted.nextMessages);
+          this.customEntries.push({
+            id: randomUUID(),
+            customType: "harness.compaction",
+            data: {
+              trigger: "overflow",
+              summary: compacted.result.summary,
+              compactedMessages: compacted.result.compactedMessages,
+              keptMessages: compacted.result.keptMessages,
+              tokensBefore: compacted.result.tokensBefore,
+              tokensAfter: compacted.result.tokensAfter,
+            },
+            timestamp: this.now(),
+          });
+          continue;
+        }
+      }
+
+      // Transient provider error auto-retry.
+      if (retryAttempt < maxRetries && isRetryableAssistantError(lastAssistant)) {
+        retryAttempt += 1;
+        const delayMs = retryDelayMs(
+          { baseDelayMs, maxAgentDelayMs: maxDelayMs },
+          retryAttempt,
+        );
+        this.retry?.onRetry?.({
+          attempt: retryAttempt,
+          maxRetries,
+          delayMs,
+          errorMessage: lastAssistant.errorMessage || "Model request failed",
+        });
+        await sleep(delayMs, runHandle.abortController.signal);
+        if (runHandle.abortRequested) {
+          break;
+        }
+        this.agent.state.messages = stripTrailingFailedAssistants(this.agent.state.messages);
+        continue;
+      }
+
+      break;
     }
 
-    const producedMessages = this.agent.state.messages.slice(baselineMessageCount);
-    const lastAssistant = findLastAssistantMessage(producedMessages);
     const wasAborted = runHandle.abortRequested || lastAssistant?.stopReason === "aborted";
 
     let finalStatus: SessionTerminalStatus;
@@ -613,16 +1245,11 @@ export class HarnessSession {
     status: SessionTerminalStatus,
     lastError: string | undefined,
   ): Promise<SessionRunResult> {
-    const finalSnapshot: SessionSnapshot = {
-      version: SESSION_SNAPSHOT_VERSION,
-      sessionId: this.sessionId,
-      model: { provider: this.committedSnapshot.model.provider, modelId: this.committedSnapshot.model.modelId },
-      messages: structuredClone(finalMessages),
-      ...(this.customEntries.length > 0 ? { customEntries: structuredClone(this.customEntries) } : {}),
+    const finalSnapshot = this.buildSnapshot({
+      messages: finalMessages,
       status,
-      ...(lastError !== undefined ? { lastError } : {}),
-      updatedAt: this.now(),
-    };
+      lastError,
+    });
 
     try {
       await this.store.save(this.sessionId, finalSnapshot);
