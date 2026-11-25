@@ -132,7 +132,7 @@ describe("SQLite persistence and hard-kill crash recovery", () => {
     }
   });
 
-  it("marks a session interrupted without dangling tool calls after hard kill mid-tool", async () => {
+  it("marks a session interrupted and preserves completed assistant toolCall after hard kill mid-tool", async () => {
     const dir = await mkdtemp(join(tmpdir(), "pilite-crash-tool-"));
     const dbPath = join(dir, "session.sqlite");
     try {
@@ -157,11 +157,12 @@ describe("SQLite persistence and hard-kill crash recovery", () => {
 
         expect(faux.state.callCount).toBe(0);
         expect(reopened.getSnapshot().status).toBe("interrupted");
-        // No incomplete assistant toolCall or orphaned toolResult is persisted.
-        expect(reopened.getSnapshot().messages.map((m) => m.role)).toEqual(["system", "user"]);
+        // Message-level persistence preserved the completed assistant(toolCall) without
+        // synthesizing a fake toolResult on disk (pi-ai handles orphaned toolCall on next prompt).
+        expect(reopened.getSnapshot().messages.map((m) => m.role)).toEqual(["system", "user", "assistant"]);
 
-        const retried = await reopened.continue();
-        expect(retried.status).toBe("idle");
+        const next = await reopened.prompt("Proceed after interruption");
+        expect(next.status).toBe("idle");
         expect(faux.state.callCount).toBe(1);
       } finally {
         await store.close();

@@ -721,4 +721,141 @@ describe("HarnessSession", () => {
       expect(seenSystemPrompts).toEqual(["Prompt v1", "Prompt v1", "Prompt v2"]);
     });
   });
+
+  describe("message-level incremental persistence (aligned with pi-coding-agent)", () => {
+    it("persists completed messages incrementally on message_end and recovers cleanly if crashed mid-tool", async () => {
+      const { faux, models, store } = createTestEnv();
+      const tool2Entered = createDeferred();
+      const tool2Gate = createDeferred();
+
+      const stepTool: AgentTool = {
+        name: "step",
+        label: "Step",
+        description: "Multi-step tool",
+        parameters: obj({ n: str() }),
+        execute: async (_id, params) => {
+          const n = (params as { n: string }).n;
+          if (n === "2") {
+            tool2Entered.resolve();
+            await tool2Gate.promise;
+          }
+          return { content: [{ type: "text", text: `done:${n}` }], details: { n } };
+        },
+      };
+
+      faux.setResponses([
+        fauxAssistantMessage(fauxToolCall("step", { n: "1" }, { id: "tc-step-1" }), {
+          stopReason: "toolUse",
+        }),
+        fauxAssistantMessage(fauxToolCall("step", { n: "2" }, { id: "tc-step-2" }), {
+          stopReason: "toolUse",
+        }),
+        fauxAssistantMessage("All steps finished."),
+      ]);
+
+      const session = await createSession({
+        sessionId: "sess-msg-level",
+        models,
+        store,
+        model: { provider: "faux", modelId: "faux-1" },
+        tools: [stepTool],
+      });
+
+      const runPromise = session.prompt("Run steps 1 and 2");
+      await tool2Entered.promise;
+
+      // Before step 2 finishes (simulated crash point), step 1's assistant+toolResult AND step 2's
+      // assistant(toolCall) are already persisted on disk with status="running".
+      const crashedSnapshot = await store.load("sess-msg-level");
+      expect(crashedSnapshot?.status).toBe("running");
+      expect(crashedSnapshot?.messages.map((m) => m.role)).toEqual([
+        "system",
+        "user",
+        "assistant",
+        "toolResult",
+        "assistant",
+      ]);
+
+      // Simulate reopening that exact crashed snapshot in a fresh store (without waiting for runPromise).
+      const recoveryStore = new InMemorySessionStore();
+      await recoveryStore.save("sess-msg-level", crashedSnapshot!);
+
+      const recovered = await openSession({
+        sessionId: "sess-msg-level",
+        models,
+        store: recoveryStore,
+        tools: [stepTool],
+      });
+      // Aligned with pi-coding-agent: marks interrupted without synthesizing fake toolResult on disk.
+      expect(recovered.getSnapshot().status).toBe("interrupted");
+      expect(recovered.getSnapshot().messages.map((m) => m.role)).toEqual([
+        "system",
+        "user",
+        "assistant",
+        "toolResult",
+        "assistant",
+      ]);
+
+      // continue() rejects on a trailing assistant message; prompt() proceeds cleanly with all prior progress kept.
+      await expectHarnessError(recovered.continue(), "NOTHING_TO_CONTINUE");
+      faux.setResponses([
+        fauxAssistantMessage("Continued after crash with step 1 preserved."),
+        fauxAssistantMessage("All steps finished."),
+      ]);
+      const next = await recovered.prompt("Skip step 2 and summarize step 1");
+      expect(next.status).toBe("idle");
+      expect(next.snapshot.messages.map((m) => m.role)).toEqual([
+        "system",
+        "user",
+        "assistant",
+        "toolResult",
+        "assistant",
+        "user",
+        "assistant",
+      ]);
+
+      // Let the original run settle cleanly so no dangling promises remain.
+      tool2Gate.resolve();
+      const originalResult = await runPromise;
+      expect(originalResult.status).toBe("idle");
+    });
+
+    it("rolls back to the last persisted message_end snapshot when final status commit fails", async () => {
+      const { faux, models } = createTestEnv();
+      const innerStore = new InMemorySessionStore();
+      let saveCount = 0;
+
+      const flakyFinalStore: SessionStore = {
+        load: (id) => innerStore.load(id),
+        save: async (id, snapshot) => {
+          saveCount += 1;
+          // 1 = create, 2 = pre-run running, 3 = assistant message_end (succeeds), 4 = final idle commit (fails!)
+          if (saveCount === 4) {
+            throw new Error("disk full on final status commit");
+          }
+          await innerStore.save(id, snapshot);
+        },
+        delete: (id) => innerStore.delete(id),
+        list: () => innerStore.list(),
+      };
+
+      faux.setResponses([fauxAssistantMessage("already saved on message_end")]);
+      const session = await createSession({
+        sessionId: "sess-msg-final-fail",
+        models,
+        store: flakyFinalStore,
+        model: { provider: "faux", modelId: "faux-1" },
+      });
+
+      await expect(session.prompt("hello")).rejects.toThrow("disk full on final status commit");
+
+      // Memory matches the last persisted snapshot (status="running" with the saved assistant message intact).
+      const inMemory = session.getSnapshot();
+      const persisted = await innerStore.load("sess-msg-final-fail");
+      expect(inMemory).toEqual(persisted);
+      expect(inMemory.status).toBe("running");
+      expect(inMemory.messages.map((m) => m.role)).toEqual(["user", "assistant"]);
+      await expectHarnessError(session.prompt("next"), "SESSION_INVALIDATED");
+    });
+  });
 });

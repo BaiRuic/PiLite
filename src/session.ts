@@ -72,6 +72,14 @@ interface ActiveRun {
   promise: Promise<SessionRunResult>;
   abortRequested: boolean;
   abortController: AbortController;
+  /** Initial `pendingMessages` already saved in `preRunSnapshot`, skipped on their `message_end`. */
+  pendingMessagesToSkip: Set<AgentMessage>;
+  /** Live full append-only transcript mirrored incrementally on each `message_end`. */
+  liveFullMessages: AgentMessage[];
+  /** Last snapshot successfully saved to `store` during this run (for rollback on save error). */
+  lastPersistedSnapshot: SessionSnapshot | undefined;
+  /** Captured if incremental `message_end` persistence fails. */
+  persistenceError: unknown;
 }
 
 function validateMaxTurns(maxTurns: number | undefined): void {
@@ -535,6 +543,7 @@ export class HarnessSession {
             toolName: event.message.toolName,
           });
         }
+        await this.persistMessageEnd(event.message);
       }
       await this.extensions.emitAgentEvent(event);
       for (const listener of [...this.listeners]) {
@@ -1404,6 +1413,10 @@ export class HarnessSession {
       promise: Promise.resolve() as unknown as Promise<SessionRunResult>,
       abortRequested: false,
       abortController: new AbortController(),
+      pendingMessagesToSkip: new Set(),
+      liveFullMessages: [],
+      lastPersistedSnapshot: undefined,
+      persistenceError: undefined,
     };
     this.activeRun = runHandle;
 
@@ -1523,6 +1536,8 @@ export class HarnessSession {
       throw error;
     }
     this.committedSnapshot = structuredClone(preRunSnapshot);
+    runHandle.liveFullMessages = structuredClone(preRunSnapshot.messages);
+    runHandle.lastPersistedSnapshot = structuredClone(preRunSnapshot);
 
     let runFullMessages = structuredClone(preRunSnapshot.messages);
     if (runHandle.abortRequested) {
@@ -1544,26 +1559,33 @@ export class HarnessSession {
       this.completedTurnsInRun = 0;
       this.maxTurnsReachedInRun = false;
 
-      let producedMessages: AgentMessage[];
+      let attemptMessages: AgentMessage[];
       if (firstInvocation && activePlan.kind === "prompt") {
         firstInvocation = false;
-        const producedStart = this.agent.state.messages.length + activePlan.pendingMessages.length;
+        runHandle.pendingMessagesToSkip = new Set(activePlan.pendingMessages);
+        const attemptStart = this.agent.state.messages.length;
         await this.agent.prompt(activePlan.pendingMessages);
-        producedMessages = this.agent.state.messages.slice(producedStart);
+        attemptMessages = this.agent.state.messages.slice(attemptStart);
       } else {
         if (firstInvocation) {
           firstInvocation = false;
           this.agent.state.messages = structuredClone(activePlan.preRunContextMessages);
         }
-        const producedStart = this.agent.state.messages.length;
+        runHandle.pendingMessagesToSkip = new Set();
+        const attemptStart = this.agent.state.messages.length;
         await this.agent.continue();
-        producedMessages = this.agent.state.messages.slice(producedStart);
+        attemptMessages = this.agent.state.messages.slice(attemptStart);
       }
 
-      lastAssistant = findLastAssistantMessage(producedMessages);
+      if (runHandle.persistenceError !== undefined) {
+        this.rollbackAndInvalidate(runHandle.lastPersistedSnapshot ?? preRunSnapshot);
+        throw runHandle.persistenceError;
+      }
+
+      runFullMessages = structuredClone(runHandle.liveFullMessages);
+      lastAssistant = findLastAssistantMessage(attemptMessages);
 
       if (runHandle.abortRequested || this.maxTurnsReachedInRun || lastAssistant?.stopReason !== "error") {
-        runFullMessages.push(...structuredClone(producedMessages));
         break;
       }
 
@@ -1574,8 +1596,7 @@ export class HarnessSession {
         isContextOverflow(lastAssistant, this.effectiveContextWindow() || undefined)
       ) {
         overflowRecoveryAttempted = true;
-        const keptFromAttempt = stripTrailingFailedAssistants(producedMessages);
-        const candidateFullMessages = [...runFullMessages, ...structuredClone(keptFromAttempt)];
+        const candidateFullMessages = stripTrailingFailedAssistants(runFullMessages);
         const keepRecentTokens = this.compaction.keepRecentTokens ?? DEFAULT_COMPACTION_KEEP_RECENT_TOKENS;
         const compacted = await this.runCompactionCheckpoint({
           fullMessages: candidateFullMessages,
@@ -1588,6 +1609,7 @@ export class HarnessSession {
         });
         if (compacted.compacted && !runHandle.abortRequested) {
           runFullMessages = candidateFullMessages;
+          runHandle.liveFullMessages = structuredClone(runFullMessages);
           this.compactionCheckpoints = [...this.compactionCheckpoints, compacted.checkpoint];
           this.agent.state.messages = structuredClone(compacted.nextContextMessages);
           await this.extensions.emitSessionCompact({
@@ -1613,16 +1635,14 @@ export class HarnessSession {
         });
         await sleep(delayMs, runHandle.abortController.signal);
         if (runHandle.abortRequested) {
-          runFullMessages.push(...structuredClone(producedMessages));
           break;
         }
-        const keptFromAttempt = stripTrailingFailedAssistants(producedMessages);
-        runFullMessages.push(...structuredClone(keptFromAttempt));
+        runFullMessages = stripTrailingFailedAssistants(runFullMessages);
+        runHandle.liveFullMessages = structuredClone(runFullMessages);
         this.agent.state.messages = stripTrailingFailedAssistants(this.agent.state.messages);
         continue;
       }
 
-      runFullMessages.push(...structuredClone(producedMessages));
       break;
     }
 
@@ -1653,7 +1673,58 @@ export class HarnessSession {
       }
     }
 
-    return this.commitFinalSnapshot(preRunSnapshot, runFullMessages, finalStatus, lastError);
+    return this.commitFinalSnapshot(
+      runHandle.lastPersistedSnapshot ?? preRunSnapshot,
+      runFullMessages,
+      finalStatus,
+      lastError,
+    );
+  }
+
+  private async persistMessageEnd(message: AgentMessage): Promise<void> {
+    const run = this.activeRun;
+    if (!run || run.persistenceError !== undefined) return;
+
+    if (run.pendingMessagesToSkip.has(message)) {
+      run.pendingMessagesToSkip.delete(message);
+      return;
+    }
+    if (isEmptyAbortedAssistantMessage(message)) {
+      return;
+    }
+
+    const nextFullMessages = [...run.liveFullMessages];
+    const insertIndex = Math.max(0, nextFullMessages.length - run.pendingMessagesToSkip.size);
+    nextFullMessages.splice(insertIndex, 0, structuredClone(message));
+
+    const midRunSnapshot = this.buildSnapshot({
+      messages: nextFullMessages,
+      compactions: this.compactionCheckpoints,
+      status: "running",
+      lastError: undefined,
+    });
+
+    try {
+      await this.store.save(this.sessionId, midRunSnapshot);
+    } catch (error) {
+      run.persistenceError = error;
+      run.abortController.abort();
+      this.agent.clearAllQueues();
+      this.agent.abort();
+      return;
+    }
+
+    run.liveFullMessages = nextFullMessages;
+    run.lastPersistedSnapshot = structuredClone(midRunSnapshot);
+    this.committedSnapshot = structuredClone(midRunSnapshot);
+  }
+
+  private rollbackAndInvalidate(rollbackSnapshot: SessionSnapshot): void {
+    this.compactionCheckpoints = structuredClone(rollbackSnapshot.compactions ?? []);
+    this.agent.state.messages = projectContextMessages(rollbackSnapshot.messages, this.compactionCheckpoints);
+    this.customEntries = structuredClone(rollbackSnapshot.customEntries ?? []);
+    this.committedSnapshot = structuredClone(rollbackSnapshot);
+    this.invalidated = true;
   }
 
   private async commitFinalSnapshot(
@@ -1673,14 +1744,7 @@ export class HarnessSession {
       await this.store.save(this.sessionId, finalSnapshot);
     } catch (error) {
       // Keep memory aligned with the last committed snapshot and force reopen.
-      this.compactionCheckpoints = structuredClone(rollbackSnapshot.compactions ?? []);
-      this.agent.state.messages = projectContextMessages(
-        rollbackSnapshot.messages,
-        this.compactionCheckpoints,
-      );
-      this.customEntries = structuredClone(rollbackSnapshot.customEntries ?? []);
-      this.committedSnapshot = structuredClone(rollbackSnapshot);
-      this.invalidated = true;
+      this.rollbackAndInvalidate(rollbackSnapshot);
       throw error;
     }
 

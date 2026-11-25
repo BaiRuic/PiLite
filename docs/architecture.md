@@ -13,7 +13,7 @@
 | Layer | Responsibilities | Source |
 | --- | --- | --- |
 | `pi-agent-core` / `pi-ai` | Agent loop, tool execution, streaming events, wire protocols, OAuth/auth primitives | External deps |
-| Core harness | Session lifecycle, run-level atomic persistence, crash recovery, retry/compaction, headless extensions | [src/session.ts](../src/session.ts), [src/extensions/](../src/extensions/) |
+| Core harness | Session lifecycle, message-level persistence, crash recovery, retry/compaction, headless extensions | [src/session.ts](../src/session.ts), [src/extensions/](../src/extensions/) |
 | Storage & model modules | Portable multi-backend persistence and unified model/credential/embedding assembly | [src/store/](../src/store/), [src/models/](../src/models/) |
 | Host application | Injects domain tools, selects storage & model sources, owns UI/API and distribution | Caller |
 
