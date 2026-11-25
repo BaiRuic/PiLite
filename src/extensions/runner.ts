@@ -5,6 +5,7 @@ import type {
   AgentTool,
   AgentToolCallOutcome,
   BeforeToolCallResult,
+  ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { CustomSessionEntry, SessionSnapshot } from "../types.js";
@@ -12,10 +13,11 @@ import { BUILTIN_COMPACTION_EXTENSION_NAME } from "./default-compaction.js";
 import type {
   BeforeAgentStartEvent,
   BeforeAgentStartResult,
-  BeforeProviderRequestResult,
   ContextExtensionResult,
+  ContextUsage,
   ExecuteToolOptions,
   ExtensionAPI,
+  ExtensionCompactOptions,
   ExtensionContext,
   ExtensionDiagnostic,
   ExtensionEventBus,
@@ -25,6 +27,7 @@ import type {
   ExtensionExecResult,
   ExtensionRegistration,
   ExtensionToolDefinition,
+  ExtensionToolInfo,
   ExtensionUIAdapter,
   ExtensionUIContext,
   SessionBeforeCompactEvent,
@@ -69,6 +72,10 @@ type RegisteredHandler = {
 export interface ExtensionHostBindings {
   readonly sessionId: string;
   getModel(): Model<Api> | undefined;
+  getThinkingLevel(): ThinkingLevel;
+  setThinkingLevel(level: ThinkingLevel): Promise<void>;
+  getSessionName(): string | undefined;
+  setSessionName(name: string | undefined): Promise<void>;
   readonly ui?: ExtensionUIAdapter;
   readonly exec?: ExtensionExecFn;
   readonly onDiagnostic?: (diagnostic: ExtensionDiagnostic) => void;
@@ -77,6 +84,9 @@ export interface ExtensionHostBindings {
   getCustomEntries<T = unknown>(customType?: string): readonly CustomSessionEntry<T>[];
   appendCustomEntry<T = unknown>(customType: string, data?: T): CustomSessionEntry<T>;
   isIdle(): boolean;
+  hasPendingMessages(): boolean;
+  getContextUsage(): ContextUsage | undefined;
+  compact(options?: ExtensionCompactOptions): void;
   getSignal(): AbortSignal | undefined;
   abort(): void;
   executeTool(
@@ -203,6 +213,14 @@ export class ExtensionRunner {
 
   getAllToolNames(): string[] {
     return [...this.tools.keys()];
+  }
+
+  getAllTools(): ExtensionToolInfo[] {
+    return [...this.tools.values()].map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters,
+    }));
   }
 
   getAllAgentTools(): AgentTool<any>[] {
@@ -368,12 +386,9 @@ export class ExtensionRunner {
     let current = payload;
     for (const handler of [...list]) {
       try {
-        const result = (await handler.fn(
-          { type: "before_provider_request", payload: current, model },
-          ctx,
-        )) as BeforeProviderRequestResult | undefined;
-        if (result && "payload" in result && result.payload !== undefined) {
-          current = result.payload;
+        const result = await handler.fn({ type: "before_provider_request", payload: current, model }, ctx);
+        if (result !== undefined) {
+          current = result;
         }
       } catch (error) {
         this.reportHandlerError(handler.extensionName, "before_provider_request", error);
@@ -425,43 +440,81 @@ export class ExtensionRunner {
     const ctx = this.createContext();
     let content = event.content;
     let details = event.details;
+    let structuredContent = event.structuredContent;
+    let usage = event.usage;
     let isError = event.isError;
     let terminate: boolean | undefined;
-    let modified = false;
+
+    let contentModified = false;
+    let detailsModified = false;
+    let structuredContentModified = false;
+    let usageModified = false;
+    let isErrorModified = false;
+    let terminateModified = false;
 
     for (const handler of [...list]) {
       try {
-        const result = (await handler.fn({ ...event, content, details, isError }, ctx)) as
-          | ToolResultExtensionResult
-          | undefined;
+        const nextEvent: ToolResultExtensionEvent = {
+          ...event,
+          content,
+          details,
+          isError,
+          ...(structuredContent !== undefined ? { structuredContent } : {}),
+          ...(usage !== undefined ? { usage } : {}),
+        };
+        const result = (await handler.fn(nextEvent, ctx)) as ToolResultExtensionResult | undefined;
         if (!result) continue;
         if (result.content !== undefined) {
           content = result.content;
-          modified = true;
+          contentModified = true;
+          if (result.structuredContent === undefined) {
+            structuredContent = undefined;
+            structuredContentModified = false;
+          }
         }
         if (result.details !== undefined) {
           details = result.details;
-          modified = true;
+          detailsModified = true;
+        }
+        if (result.structuredContent !== undefined) {
+          structuredContent = result.structuredContent;
+          structuredContentModified = true;
+        }
+        if (result.usage !== undefined) {
+          usage = result.usage;
+          usageModified = true;
         }
         if (result.isError !== undefined) {
           isError = result.isError;
-          modified = true;
+          isErrorModified = true;
         }
         if (result.terminate !== undefined) {
           terminate = result.terminate;
-          modified = true;
+          terminateModified = true;
         }
       } catch (error) {
         this.reportHandlerError(handler.extensionName, "tool_result", error);
       }
     }
 
-    if (!modified) return undefined;
+    if (
+      !contentModified &&
+      !detailsModified &&
+      !structuredContentModified &&
+      !usageModified &&
+      !isErrorModified &&
+      !terminateModified
+    ) {
+      return undefined;
+    }
+
     return {
-      content,
-      details,
-      isError,
-      ...(terminate !== undefined ? { terminate } : {}),
+      ...(contentModified ? { content } : {}),
+      ...(detailsModified ? { details } : {}),
+      ...(structuredContentModified ? { structuredContent } : {}),
+      ...(usageModified ? { usage } : {}),
+      ...(isErrorModified ? { isError } : {}),
+      ...(terminateModified ? { terminate } : {}),
     };
   }
 
@@ -481,7 +534,10 @@ export class ExtensionRunner {
 
   private createAPI(extensionName: string): ExtensionAPI {
     return {
-      on: (event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<unknown> | unknown) => {
+      on: ((
+        event: string,
+        handler: (event: unknown, ctx: ExtensionContext) => Promise<unknown> | unknown,
+      ) => {
         if (!SUPPORTED_EVENTS.has(event)) {
           this.onDiagnostic?.({
             kind: "deferred_event",
@@ -503,7 +559,7 @@ export class ExtensionRunner {
           const idx = current.indexOf(entry);
           if (idx !== -1) current.splice(idx, 1);
         };
-      },
+      }) as ExtensionAPI["on"],
       registerTool: <TParameters extends Record<string, any>, TDetails>(
         definition: ExtensionToolDefinition<TParameters, TDetails>,
       ) => {
@@ -525,7 +581,11 @@ export class ExtensionRunner {
       },
       getActiveTools: () => this.getActiveToolNames(),
       setActiveTools: (toolNames: string[]) => this.setActiveToolNames(toolNames),
-      getAllTools: () => this.getAllToolNames(),
+      getAllTools: () => this.getAllTools(),
+      getThinkingLevel: () => this.requireBindings().getThinkingLevel(),
+      setThinkingLevel: (level: ThinkingLevel) => this.requireBindings().setThinkingLevel(level),
+      getSessionName: () => this.requireBindings().getSessionName(),
+      setSessionName: (name: string | undefined) => this.requireBindings().setSessionName(name),
       appendEntry: <T = unknown>(customType: string, data?: T): CustomSessionEntry<T> => {
         const bindings = this.requireBindings();
         return bindings.appendCustomEntry(customType, data);
@@ -552,14 +612,24 @@ export class ExtensionRunner {
     const { hasUI, ui } = createUIContext(bindings.ui);
     return {
       sessionId: bindings.sessionId,
-      model: bindings.getModel(),
+      get model() {
+        return bindings.getModel();
+      },
+      get thinkingLevel() {
+        return bindings.getThinkingLevel();
+      },
+      get signal() {
+        return bindings.getSignal();
+      },
       hasUI,
       ui,
       getSystemPrompt: () => bindings.getSystemPrompt(),
       getSnapshot: () => bindings.getSnapshot(),
       getCustomEntries: <T = unknown>(customType?: string) => bindings.getCustomEntries<T>(customType),
       isIdle: () => bindings.isIdle(),
-      getSignal: () => bindings.getSignal(),
+      hasPendingMessages: () => bindings.hasPendingMessages(),
+      getContextUsage: () => bindings.getContextUsage(),
+      compact: (options?: ExtensionCompactOptions) => bindings.compact(options),
       abort: () => bindings.abort(),
       executeTool: (name, args, options) => bindings.executeTool(name, args, options, parentToolCallId),
     };

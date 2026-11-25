@@ -3,13 +3,20 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import { obj, str } from "@earendil-works/pi-schema";
 import { describe, expect, it } from "vitest";
 import {
+  type CompactionResult,
+  type ContextUsage,
   createSession,
   defineTool,
+  type ExtensionContext,
   type ExtensionDiagnostic,
+  type ExtensionExecOptions,
   type ExtensionFactory,
+  ExtensionRunner,
+  type ExtensionToolInfo,
   InMemorySessionStore,
   openSession,
   type SessionStore,
+  type SessionUsageEvent,
 } from "../src/index.js";
 
 function createTestEnv() {
@@ -323,9 +330,14 @@ describe("Headless Extension System", () => {
             const approved = await ctx.ui.confirm("Approve", "Run check?");
             ctx.ui.notify(`approved=${approved}`, "info");
             pi.events.emit("ping", { approved });
-            const execResult = await pi.exec("echo", ["hello"]);
+            const execResult = await pi.exec("echo", ["hello"], { timeout: 5_000 });
             return {
-              content: [{ type: "text", text: `approved:${approved};out:${execResult.stdout}` }],
+              content: [
+                {
+                  type: "text",
+                  text: `approved:${approved};out:${execResult.stdout};code:${execResult.code};killed:${String(execResult.killed)}`,
+                },
+              ],
               details: {},
             };
           },
@@ -340,6 +352,7 @@ describe("Headless Extension System", () => {
       fauxAssistantMessage("Host check passed."),
     ]);
 
+    let seenExecOptions: ExtensionExecOptions | undefined;
     const session = await createSession({
       sessionId: "sess-bridges",
       models,
@@ -350,12 +363,22 @@ describe("Headless Extension System", () => {
         confirm: async () => true,
         notify: (msg) => notifications.push(msg),
       },
-      exec: async (cmd, args) => ({ stdout: `${cmd}:${args.join(" ")}`, stderr: "", exitCode: 0 }),
+      exec: async (cmd, args, opts) => {
+        seenExecOptions = opts;
+        return {
+          stdout: `${cmd}:${args.join(" ")}`,
+          stderr: "",
+          code: 0,
+          killed: false,
+          truncated: false,
+        };
+      },
       onExtensionDiagnostic: (d) => diagnostics.push(d),
     });
 
     const result = await session.prompt("Check host");
     expect(result.status).toBe("idle");
+    expect(seenExecOptions?.timeout).toBe(5_000);
     expect(busMessages).toEqual([{ approved: true }]);
     expect(notifications).toEqual(["approved=true"]);
     expect(diagnostics.some((d) => d.kind === "deferred_event" && d.event === "session_tree")).toBe(true);
@@ -391,5 +414,359 @@ describe("Headless Extension System", () => {
     expect(sawHasUI).toBe(false);
     expect(confirmResult).toBe(false);
     expect(execRejected).toBe(true);
+  });
+
+  it("exposes ctx.signal, thinkingLevel, hasPendingMessages, getContextUsage, and fire-and-forget compact", async () => {
+    const { faux, models, store } = createTestEnv();
+    let idleSignal: AbortSignal | undefined;
+    let runSignal: AbortSignal | undefined;
+    let idleThinkingLevel: string | undefined;
+    let idlePending = true;
+    let runPendingBefore = true;
+    let runPendingAfter = false;
+    let idleUsage: ContextUsage | undefined;
+    let compactBusyError: Error | undefined;
+    let savedCtx!: ExtensionContext;
+
+    let sessionRef: Awaited<ReturnType<typeof createSession>> | undefined;
+
+    const inspectExt: ExtensionFactory = (pi) => {
+      pi.on("session_start", (_event, ctx) => {
+        savedCtx = ctx;
+        idleSignal = ctx.signal;
+        idleThinkingLevel = ctx.thinkingLevel;
+        idlePending = ctx.hasPendingMessages();
+        idleUsage = ctx.getContextUsage();
+      });
+
+      pi.registerTool(
+        defineTool({
+          name: "probe_ctx",
+          description: "Inspects live ExtensionContext during a run",
+          parameters: obj({}),
+          execute: async (_id, _params, _signal, _onUpdate, ctx) => {
+            runSignal = ctx.signal;
+            runPendingBefore = ctx.hasPendingMessages();
+            sessionRef?.steer("queued steering");
+            runPendingAfter = ctx.hasPendingMessages();
+            await new Promise<void>((resolve) => {
+              ctx.compact({
+                onError: (err) => {
+                  compactBusyError = err;
+                  resolve();
+                },
+              });
+            });
+            return { content: [{ type: "text", text: "probed" }], details: {} };
+          },
+        }),
+      );
+    };
+
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("probe_ctx", {}, { id: "tc-probe" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("First turn done with extra text to grow context."),
+      fauxAssistantMessage("Second turn response to enable compaction."),
+    ]);
+
+    const session = await createSession({
+      sessionId: "sess-ctx-helpers",
+      models,
+      store,
+      model: { provider: "faux", modelId: "faux-1" },
+      thinkingLevel: "low",
+      compaction: {
+        contextWindow: 1000,
+        keepRecentTokens: 1,
+        summarizer: async ({ instructions }) => ({
+          summary: `Compact summary (${instructions ?? "none"})`,
+        }),
+      },
+      extensions: [inspectExt],
+    });
+    sessionRef = session;
+
+    expect(idleSignal).toBeUndefined();
+    expect(idleThinkingLevel).toBe("low");
+    expect(idlePending).toBe(false);
+    expect(idleUsage).toBeDefined();
+    expect(idleUsage?.contextWindow).toBe(1000);
+    expect(idleUsage?.tokens).toBeGreaterThanOrEqual(0);
+    expect(idleUsage?.percent).toBe(((idleUsage?.tokens ?? 0) / 1000) * 100);
+
+    await session.prompt("Run probe tool");
+    expect(runSignal).toBeInstanceOf(AbortSignal);
+    expect(runPendingBefore).toBe(false);
+    expect(runPendingAfter).toBe(true);
+    expect(compactBusyError).toBeInstanceOf(Error);
+
+    // After run completes, ctx.signal returns to undefined and ctx.compact() succeeds.
+    expect(savedCtx.signal).toBeUndefined();
+    await session.prompt("More conversation context for compaction.");
+
+    const compactResult = await new Promise<CompactionResult>((resolve, reject) => {
+      savedCtx.compact({
+        customInstructions: "keep decisions",
+        onComplete: resolve,
+        onError: reject,
+      });
+    });
+    expect(compactResult.compacted).toBe(true);
+    expect(compactResult.summary).toBe("Compact summary (keep decisions)");
+  });
+
+  it("supports tool_result structuredContent and usage overrides across main and nested tool calls", async () => {
+    const { faux, models, store } = createTestEnv();
+    const seenToolResults: Array<{ structuredContent?: unknown; usageTokens?: number }> = [];
+    const usageEvents: SessionUsageEvent[] = [];
+    let nestedStructuredContent: unknown;
+    let nestedUsageTokens: number | undefined;
+
+    const toolUsage = {
+      input: 10,
+      output: 5,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 15,
+      cost: { input: 0.01, output: 0.02, cacheRead: 0, cacheWrite: 0, total: 0.03 },
+    };
+
+    const overrideExt: ExtensionFactory = (pi) => {
+      pi.registerTool(
+        defineTool({
+          name: "inner_tool",
+          description: "Returns structured content and usage",
+          parameters: obj({}),
+          execute: async () => ({
+            content: [{ type: "text", text: "inner" }],
+            details: { raw: true },
+            structuredContent: { stage: "raw" },
+            usage: {
+              input: 1,
+              output: 1,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 2,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+          }),
+        }),
+      );
+
+      pi.registerTool(
+        defineTool({
+          name: "outer_tool",
+          description: "Calls inner_tool via ctx.executeTool",
+          parameters: obj({}),
+          execute: async (_id, _params, _signal, _onUpdate, ctx) => {
+            const nested = await ctx.executeTool("inner_tool", {});
+            nestedStructuredContent = nested.result.structuredContent;
+            nestedUsageTokens = nested.result.usage?.totalTokens;
+            return {
+              content: [{ type: "text", text: "outer" }],
+              details: {},
+              structuredContent: { from: "outer" },
+            };
+          },
+        }),
+      );
+
+      pi.on("tool_result", (event) => {
+        seenToolResults.push({
+          structuredContent: event.structuredContent,
+          usageTokens: event.usage?.totalTokens,
+        });
+        if (event.toolName === "inner_tool") {
+          return {
+            structuredContent: { stage: "overridden" },
+            usage: toolUsage,
+          };
+        }
+        if (event.toolName === "outer_tool") {
+          return {
+            usage: toolUsage,
+          };
+        }
+        return undefined;
+      });
+    };
+
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("outer_tool", {}, { id: "tc-outer" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("Done."),
+    ]);
+
+    const session = await createSession({
+      sessionId: "sess-tool-result-fields",
+      models,
+      store,
+      model: { provider: "faux", modelId: "faux-1" },
+      extensions: [overrideExt],
+      onUsage: (event) => usageEvents.push(event),
+    });
+
+    let outerExecutionStructuredContent: unknown;
+    session.subscribe((event) => {
+      if (event.type === "tool_execution_end" && event.toolName === "outer_tool") {
+        outerExecutionStructuredContent = event.result.structuredContent;
+      }
+    });
+
+    await session.prompt("Run outer tool");
+
+    expect(seenToolResults).toEqual([
+      { structuredContent: { stage: "raw" }, usageTokens: 2 },
+      { structuredContent: { from: "outer" }, usageTokens: undefined },
+    ]);
+    expect(nestedStructuredContent).toEqual({ stage: "overridden" });
+    expect(nestedUsageTokens).toBe(15);
+    // Updating usage without touching content must preserve original structuredContent.
+    expect(outerExecutionStructuredContent).toEqual({ from: "outer" });
+
+    const toolResultMessage = session.getSnapshot().messages.find((message) => message.role === "toolResult");
+    expect(toolResultMessage?.role).toBe("toolResult");
+    if (toolResultMessage?.role === "toolResult") {
+      expect(toolResultMessage.usage?.totalTokens).toBe(15);
+    }
+    expect(
+      usageEvents.some(
+        (e) => e.source === "tool" && e.toolName === "outer_tool" && e.usage.totalTokens === 15,
+      ),
+    ).toBe(true);
+    expect(session.getStats().tokens.total).toBeGreaterThanOrEqual(15);
+  });
+
+  it("replaces provider request payload directly when before_provider_request returns a non-undefined value", async () => {
+    const { models } = createTestEnv();
+    const model = models.getModel("faux", "faux-1")!;
+    const runner = await ExtensionRunner.load({
+      baseTools: [],
+      extensions: [
+        (pi) => {
+          pi.on("before_provider_request", (event) => {
+            const payload = event.payload as Record<string, unknown>;
+            return { ...payload, temperature: 0.2 };
+          });
+          // Returning undefined preserves the previous handler's replacement payload.
+          pi.on("before_provider_request", () => undefined);
+          pi.on("before_provider_request", (event) => {
+            const payload = event.payload as Record<string, unknown>;
+            return { ...payload, extraHeader: "ok" };
+          });
+        },
+      ],
+    });
+    runner.bind({
+      sessionId: "sess-payload",
+      getModel: () => model,
+      getThinkingLevel: () => "off",
+      setThinkingLevel: async () => undefined,
+      getSessionName: () => undefined,
+      setSessionName: async () => undefined,
+      getSystemPrompt: () => "",
+      getSnapshot: () => {
+        throw new Error("unused");
+      },
+      getCustomEntries: () => [],
+      appendCustomEntry: () => {
+        throw new Error("unused");
+      },
+      isIdle: () => true,
+      hasPendingMessages: () => false,
+      getContextUsage: () => undefined,
+      compact: () => undefined,
+      getSignal: () => undefined,
+      abort: () => undefined,
+      executeTool: async () => {
+        throw new Error("unused");
+      },
+      onActiveToolsChanged: () => undefined,
+    });
+
+    const result = await runner.emitBeforeProviderRequest({ model: "faux-1" }, model);
+    expect(result).toEqual({ model: "faux-1", temperature: 0.2, extraHeader: "ok" });
+  });
+
+  it("supports pi.getAllTools() ToolInfo[], session name, and thinking level APIs when idle and mid-run", async () => {
+    const { faux, models, store } = createTestEnv();
+    let toolsFromApi: ExtensionToolInfo[] = [];
+    let apiHandle!: {
+      getAllTools: () => ExtensionToolInfo[];
+      getSessionName: () => string | undefined;
+      setSessionName: (name: string | undefined) => Promise<void>;
+      getThinkingLevel: () => string;
+      setThinkingLevel: (
+        level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max",
+      ) => Promise<void>;
+    };
+    let thinkingSeenInTool: string | undefined;
+
+    const metaExt: ExtensionFactory = (pi) => {
+      apiHandle = pi;
+      pi.registerTool(
+        defineTool({
+          name: "meta_tool",
+          description: "Updates session name and thinking level mid-run",
+          parameters: obj({ topic: str() }),
+          execute: async (_id, params, _signal, _onUpdate, ctx) => {
+            await pi.setSessionName(`Topic: ${params.topic}`);
+            await pi.setThinkingLevel("high");
+            thinkingSeenInTool = ctx.thinkingLevel;
+            return { content: [{ type: "text", text: "updated" }], details: {} };
+          },
+        }),
+      );
+      pi.on("session_start", async (event) => {
+        if (event.reason === "create") {
+          await pi.setSessionName("Initial Title");
+          await pi.setThinkingLevel("low");
+        }
+        toolsFromApi = pi.getAllTools();
+      });
+    };
+
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("meta_tool", { topic: "Extensions" }, { id: "tc-meta" }), {
+        stopReason: "toolUse",
+      }),
+      fauxAssistantMessage("Metadata updated."),
+    ]);
+
+    const session = await createSession({
+      sessionId: "sess-ext-meta",
+      models,
+      store,
+      model: { provider: "faux", modelId: "faux-1" },
+      extensions: [metaExt],
+    });
+
+    expect(toolsFromApi).toHaveLength(1);
+    expect(toolsFromApi[0]).toMatchObject({
+      name: "meta_tool",
+      description: "Updates session name and thinking level mid-run",
+    });
+    expect(toolsFromApi[0]?.parameters).toBeDefined();
+    expect(apiHandle.getSessionName()).toBe("Initial Title");
+    expect(session.title).toBe("Initial Title");
+    expect(apiHandle.getThinkingLevel()).toBe("low");
+    expect(session.thinkingLevel).toBe("low");
+
+    await session.prompt("Set topic to Extensions");
+    expect(thinkingSeenInTool).toBe("high");
+    expect(apiHandle.getSessionName()).toBe("Topic: Extensions");
+    expect(session.title).toBe("Topic: Extensions");
+    expect(apiHandle.getThinkingLevel()).toBe("high");
+    expect(session.thinkingLevel).toBe("high");
+
+    // Verify mid-run updates were persisted cleanly across reopen.
+    const reopened = await openSession({
+      sessionId: "sess-ext-meta",
+      models,
+      store,
+      extensions: [metaExt],
+    });
+    expect(reopened.title).toBe("Topic: Extensions");
+    expect(reopened.thinkingLevel).toBe("high");
+    expect(apiHandle.getAllTools().map((t) => t.name)).toEqual(["meta_tool"]);
   });
 });

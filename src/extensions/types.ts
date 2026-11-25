@@ -4,11 +4,17 @@ import type {
   AgentToolCallOutcome,
   AgentToolResult,
   AgentToolUpdateCallback,
+  ThinkingLevel,
   ToolExecutionMode,
 } from "@earendil-works/pi-agent-core";
-import type { Api, ImageContent, Model, TextContent, Usage } from "@earendil-works/pi-ai";
+import type { Api, ImageContent, JsonValue, Model, TextContent, Usage } from "@earendil-works/pi-ai";
 import type { Static } from "@earendil-works/pi-schema";
-import type { CompactionCheckpoint, CompactionPreparation, CompactionTrigger } from "../compaction.js";
+import type {
+  CompactionCheckpoint,
+  CompactionPreparation,
+  CompactionResult,
+  CompactionTrigger,
+} from "../compaction.js";
 import type { CustomSessionEntry, SessionSnapshot } from "../types.js";
 
 export interface ExtensionUIDialogOptions {
@@ -33,13 +39,16 @@ export interface ExtensionUIAdapter {
 export interface ExtensionExecOptions {
   readonly cwd?: string;
   readonly signal?: AbortSignal;
-  readonly timeoutMs?: number;
+  /** Timeout in milliseconds. */
+  readonly timeout?: number;
 }
 
 export interface ExtensionExecResult {
   readonly stdout: string;
   readonly stderr: string;
-  readonly exitCode: number;
+  readonly code: number;
+  readonly killed?: boolean;
+  readonly truncated?: boolean;
 }
 
 export type ExtensionExecFn = (
@@ -58,16 +67,45 @@ export interface ExecuteToolOptions {
   readonly onUpdate?: AgentToolUpdateCallback<any>;
 }
 
+/** Current context token usage relative to the active model's context window. */
+export interface ContextUsage {
+  /** Estimated context tokens, or `null` when unknown. */
+  readonly tokens: number | null;
+  /** Active model context window size in tokens. */
+  readonly contextWindow: number;
+  /** Context usage as a percentage of `contextWindow`, or `null` when `tokens` is `null`. */
+  readonly percent: number | null;
+}
+
+/** Options for fire-and-forget compaction via `ctx.compact()`. */
+export interface ExtensionCompactOptions {
+  readonly customInstructions?: string;
+  readonly onComplete?: (result: CompactionResult) => void;
+  readonly onError?: (error: Error) => void;
+}
+
+/** Metadata for a registered tool returned by `pi.getAllTools()`. */
+export interface ExtensionToolInfo {
+  readonly name: string;
+  readonly description: string;
+  readonly parameters: unknown;
+}
+
 export interface ExtensionContext {
   readonly sessionId: string;
   readonly model: Model<Api> | undefined;
+  readonly thinkingLevel: ThinkingLevel;
+  readonly signal: AbortSignal | undefined;
   readonly hasUI: boolean;
   readonly ui: ExtensionUIContext;
   getSystemPrompt(): string;
   getSnapshot(): SessionSnapshot;
   getCustomEntries<T = unknown>(customType?: string): readonly CustomSessionEntry<T>[];
   isIdle(): boolean;
-  getSignal(): AbortSignal | undefined;
+  hasPendingMessages(): boolean;
+  getContextUsage(): ContextUsage | undefined;
+  /** Trigger manual compaction without awaiting completion. */
+  compact(options?: ExtensionCompactOptions): void;
   abort(): void;
   /**
    * Execute another registered tool through the same validation and
@@ -190,9 +228,11 @@ export interface BeforeProviderRequestEvent {
   readonly model: Model<Api>;
 }
 
-export interface BeforeProviderRequestResult {
-  readonly payload?: unknown;
-}
+/**
+ * Return any non-`undefined` value to replace the provider request payload directly.
+ * Return `undefined` to keep the payload unchanged.
+ */
+export type BeforeProviderRequestResult = unknown;
 
 export interface AfterProviderResponseEvent {
   readonly type: "after_provider_response";
@@ -222,6 +262,8 @@ export interface ToolResultExtensionEvent {
   readonly input: Record<string, unknown>;
   readonly content: (TextContent | ImageContent)[];
   readonly details: unknown;
+  readonly structuredContent?: JsonValue;
+  readonly usage?: Usage;
   readonly isError: boolean;
   /** Set when invoked via `ctx.executeTool()` from inside a running tool. */
   readonly parentToolCallId?: string;
@@ -230,6 +272,8 @@ export interface ToolResultExtensionEvent {
 export interface ToolResultExtensionResult {
   readonly content?: (TextContent | ImageContent)[];
   readonly details?: unknown;
+  readonly structuredContent?: JsonValue;
+  readonly usage?: Usage;
   readonly isError?: boolean;
   readonly terminate?: boolean;
 }
@@ -292,7 +336,11 @@ export interface ExtensionDiagnostic {
 }
 
 export interface ExtensionAPI {
-  on<K extends ExtensionEventName>(event: K, handler: ExtensionEventHandler<K>): () => void;
+  on(event: "before_provider_request", handler: ExtensionEventHandler<"before_provider_request">): () => void;
+  on<K extends Exclude<ExtensionEventName, "before_provider_request">>(
+    event: K,
+    handler: ExtensionEventHandler<K>,
+  ): () => void;
   on(
     event: string,
     handler: (event: unknown, ctx: ExtensionContext) => Promise<unknown> | unknown,
@@ -302,7 +350,11 @@ export interface ExtensionAPI {
   ): void;
   getActiveTools(): string[];
   setActiveTools(toolNames: string[]): void;
-  getAllTools(): string[];
+  getAllTools(): ExtensionToolInfo[];
+  getThinkingLevel(): ThinkingLevel;
+  setThinkingLevel(level: ThinkingLevel): Promise<void>;
+  getSessionName(): string | undefined;
+  setSessionName(name: string | undefined): Promise<void>;
   appendEntry<T = unknown>(customType: string, data?: T): CustomSessionEntry<T>;
   exec(command: string, args: string[], options?: ExtensionExecOptions): Promise<ExtensionExecResult>;
   readonly events: ExtensionEventBus;

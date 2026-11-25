@@ -407,6 +407,8 @@ export class HarnessSession {
           input: (args && typeof args === "object" ? args : {}) as Record<string, unknown>,
           content: result.content,
           details: result.details,
+          ...(result.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {}),
+          ...(result.usage !== undefined ? { usage: result.usage } : {}),
           isError,
         }),
       onPayload: async (payload, reqModel) => this.extensions.emitBeforeProviderRequest(payload, reqModel),
@@ -432,6 +434,23 @@ export class HarnessSession {
     this.extensions.bind({
       sessionId: snapshot.sessionId,
       getModel: () => this.resolvedModel,
+      getThinkingLevel: () => this.thinkingLevel,
+      setThinkingLevel: async (level) => {
+        if (this.activeRun) {
+          this.agent.state.thinkingLevel = level;
+          return;
+        }
+        await this.setThinkingLevel(level);
+      },
+      getSessionName: () => this.title,
+      setSessionName: async (name) => {
+        if (this.activeRun) {
+          const { title: _oldTitle, ...rest } = this.committedSnapshot;
+          this.committedSnapshot = name !== undefined ? { ...rest, title: name } : rest;
+          return;
+        }
+        await this.setTitle(name);
+      },
       ui: options.ui,
       exec: options.exec,
       onDiagnostic: options.onExtensionDiagnostic,
@@ -455,7 +474,32 @@ export class HarnessSession {
         return structuredClone(entry);
       },
       isIdle: () => !this.isRunning,
-      getSignal: () => this.agent.signal,
+      hasPendingMessages: () => this.hasQueuedMessages(),
+      getContextUsage: () => {
+        const contextWindow = this.effectiveContextWindow();
+        if (contextWindow <= 0) return undefined;
+        const tokens = estimateTranscriptTokens(this.agent.state.messages);
+        return {
+          tokens,
+          contextWindow,
+          percent: (tokens / contextWindow) * 100,
+        };
+      },
+      compact: (compactOptions) => {
+        void this.compact(
+          compactOptions?.customInstructions !== undefined
+            ? { instructions: compactOptions.customInstructions }
+            : {},
+        ).then(
+          (result) => {
+            compactOptions?.onComplete?.(result);
+          },
+          (error) => {
+            compactOptions?.onError?.(error instanceof Error ? error : new Error(String(error)));
+          },
+        );
+      },
+      getSignal: () => this.agent.signal ?? this.activeRun?.abortController.signal,
       abort: () => {
         void this.abort();
       },
@@ -519,6 +563,10 @@ export class HarnessSession {
               >,
               content: result.content,
               details: result.details,
+              ...(result.structuredContent !== undefined
+                ? { structuredContent: result.structuredContent }
+                : {}),
+              ...(result.usage !== undefined ? { usage: result.usage } : {}),
               isError,
               ...(parentToolCallId !== undefined ? { parentToolCallId } : {}),
             }),
@@ -1437,7 +1485,12 @@ export class HarnessSession {
   }
 
   private effectiveContextWindow(): number {
-    return this.compaction?.contextWindow ?? this.agent.state.model?.contextWindow ?? 0;
+    return (
+      this.compaction?.contextWindow ??
+      this.resolvedModel?.contextWindow ??
+      this.agent.state.model?.contextWindow ??
+      0
+    );
   }
 
   private async executeRun(
@@ -1722,6 +1775,7 @@ export class HarnessSession {
   private rollbackAndInvalidate(rollbackSnapshot: SessionSnapshot): void {
     this.compactionCheckpoints = structuredClone(rollbackSnapshot.compactions ?? []);
     this.agent.state.messages = projectContextMessages(rollbackSnapshot.messages, this.compactionCheckpoints);
+    this.agent.state.thinkingLevel = rollbackSnapshot.thinkingLevel ?? "off";
     this.customEntries = structuredClone(rollbackSnapshot.customEntries ?? []);
     this.committedSnapshot = structuredClone(rollbackSnapshot);
     this.invalidated = true;
