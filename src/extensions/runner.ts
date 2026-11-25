@@ -7,7 +7,7 @@ import type {
   BeforeToolCallResult,
   ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import type { Api, ImageContent, Model, ProviderHeaders, TextContent } from "@earendil-works/pi-ai";
+import type { Api, ImageContent, Model, Models, ProviderHeaders, TextContent } from "@earendil-works/pi-ai";
 import type { CustomSessionEntry, ModelRef, SessionSnapshot } from "../types.js";
 import { BUILTIN_COMPACTION_EXTENSION_NAME } from "./default-compaction.js";
 import type {
@@ -83,6 +83,7 @@ type RegisteredHandler = {
 export interface ExtensionHostBindings {
   readonly sessionId: string;
   getModel(): Model<Api> | undefined;
+  getModels(): Models;
   setModel(model: ModelRef | Model<Api>): Promise<boolean>;
   getThinkingLevel(): ThinkingLevel;
   setThinkingLevel(level: ThinkingLevel): Promise<void>;
@@ -724,6 +725,9 @@ export class ExtensionRunner {
       sessionId: bindings.sessionId,
       get model() {
         return bindings.getModel();
+      },
+      get models() {
+        return bindings.getModels();
       },
       get thinkingLevel() {
         return bindings.getThinkingLevel();

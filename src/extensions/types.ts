@@ -12,6 +12,7 @@ import type {
   ImageContent,
   JsonValue,
   Model,
+  Models,
   ProviderHeaders,
   TextContent,
   Usage,
@@ -108,6 +109,8 @@ export interface ExtensionToolInfo {
 export interface ExtensionContext {
   readonly sessionId: string;
   readonly model: Model<Api> | undefined;
+  /** Active `pi-ai` `Models` registry (catalog, auth, and direct model calls). */
+  readonly models: Models;
   readonly thinkingLevel: ThinkingLevel;
   readonly signal: AbortSignal | undefined;
   readonly hasUI: boolean;

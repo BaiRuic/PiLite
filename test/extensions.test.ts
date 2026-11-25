@@ -652,6 +652,7 @@ describe("Headless Extension System", () => {
     runner.bind({
       sessionId: "sess-payload",
       getModel: () => model,
+      getModels: () => models,
       setModel: async () => true,
       getThinkingLevel: () => "off",
       setThinkingLevel: async () => undefined,
@@ -1357,5 +1358,46 @@ describe("Headless Extension System", () => {
 
     await session.fork({ sessionId: "sess-polish-fork" });
     expect(startReasons).toEqual(["create", "fork"]);
+  });
+
+  it("exposes live ctx.models registry and session.getAvailableThinkingLevels()", async () => {
+    const faux = fauxProvider({
+      provider: "faux",
+      models: [
+        { id: "plain-model", reasoning: false },
+        { id: "reasoning-model", reasoning: true },
+      ],
+    });
+    let currentModels = createModels();
+    currentModels.setProvider(faux.provider);
+    const store = new InMemorySessionStore();
+
+    let savedCtx!: ExtensionContext;
+    const ext: ExtensionFactory = (pi) => {
+      pi.on("session_start", (_event, ctx) => {
+        savedCtx = ctx;
+      });
+    };
+
+    const session = await createSession({
+      sessionId: "sess-models-thinking",
+      models: () => currentModels,
+      store,
+      model: { provider: "faux", modelId: "plain-model" },
+      extensions: [ext],
+    });
+
+    expect(savedCtx.models).toBe(currentModels);
+    expect(savedCtx.models.getModels("faux").map((m) => m.id)).toEqual(["plain-model", "reasoning-model"]);
+    expect(session.getAvailableThinkingLevels()).toEqual(["off"]);
+
+    await session.setModel({ provider: "faux", modelId: "reasoning-model" });
+    expect(session.getAvailableThinkingLevels()).toEqual(["off", "minimal", "low", "medium", "high"]);
+
+    // Live ModelsProvider hot-swap is reflected on ctx.models and getAvailableThinkingLevels() immediately.
+    const emptyModels = createModels();
+    currentModels = emptyModels;
+    expect(savedCtx.models).toBe(emptyModels);
+    expect(session.getAvailableThinkingLevels()).toEqual(["off"]);
   });
 });

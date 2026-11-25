@@ -12,6 +12,7 @@ import {
   type ClientIdentity,
   contentText,
   getCurrentSystemMessage,
+  getSupportedThinkingLevels,
   type ImageContent,
   isContextOverflow,
   isRetryableAssistantError,
@@ -486,6 +487,7 @@ export class HarnessSession {
     this.extensions.bind({
       sessionId: snapshot.sessionId,
       getModel: () => this.resolvedModel,
+      getModels: () => this.getModels(),
       setModel: async (target) => {
         const ref: ModelRef =
           "modelId" in target
@@ -843,6 +845,15 @@ export class HarnessSession {
   /** Current thinking level. */
   get thinkingLevel(): ThinkingLevel {
     return this.agent.state.thinkingLevel;
+  }
+
+  /** Thinking levels supported by the currently resolved model (`["off"]` when unresolved or non-reasoning). */
+  getAvailableThinkingLevels(): ThinkingLevel[] {
+    const model = this.resolvedModel;
+    if (!model) {
+      return ["off"];
+    }
+    return getSupportedThinkingLevels(model);
   }
 
   /** Current session display title, if set. */
