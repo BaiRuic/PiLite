@@ -20,6 +20,7 @@
 
 - 单会话同一时刻只允许一个运行中的 run，运行期间再次调用直接拒绝（第一版不暴露 `steer` / `followUp`）。
 - 透传 `sessionId` 给 `Agent` 以复用 provider 缓存；透传 `identity`（默认不附带 `pi` 归属头，由宿主按需指定）；通过 `finishTurn` 提供可选的 `maxTurns` 护栏防止 headless 场景下工具死循环。
+- 会话操作与长对话支持：支持独立分叉 `fork()`（生成新 `sessionId`、禁止在 `toolCall`/`toolResult` 对中间切分）、idle 态切换 `setModel()` / `setThinkingLevel()` / `setTitle()`、`reset(handoff?)`、`getStats()` 用量汇总，以及按需开启的瞬时错误自动重试（`retry`）与手动/自动上下文压缩（`compact()` / `compaction`，包含超阈值与上下文溢出恢复）。
 
 ### 模型：沿用 `pi-durable` 的注入方式
 
@@ -31,7 +32,7 @@
 
 ### 会话存储与恢复
 
-定义面向会话的 `SessionStore`，核心只需要 `load(sessionId)`（不存在返回 `null`）和原子替换快照的 `save(sessionId, snapshot)`。快照包含格式版本、模型引用、消息历史、可选扩展自定义条目（`customEntries`）和运行状态（`idle | running | aborted | interrupted | error`）。参考 `pi-durable` 的多后端 + 运行时隔离抽象，通过独立 subpath 提供内存、SQLite（可移植核心 + `node:sqlite` / `bun:sqlite` 适配器）、JSONL（可移植 `JsonlFileSystem` 核心 + `node:fs` 适配，支持崩溃半截尾行恢复与压缩）和 IndexedDB 后端，所有后端共用同一套契约测试。当前不支持多个进程并发写同一会话。
+定义面向会话的 `SessionStore`，提供 `load(sessionId)`（不存在返回 `null`）、原子替换快照的 `save(sessionId, snapshot)`、`delete(sessionId)` 和 `list()`（返回按 `updatedAt` 倒序的 `SessionSummary[]`）。快照包含格式版本、模型引用、思考等级、可选标题与父会话引用、消息历史、可选扩展自定义条目（`customEntries`）和运行状态（`idle | running | aborted | interrupted | error`）。参考 `pi-durable` 的多后端 + 运行时隔离抽象，通过独立 subpath 提供内存、SQLite（可移植核心 + `node:sqlite` / `bun:sqlite` 适配器）、JSONL（可移植 `JsonlFileSystem` 核心 + `node:fs` 适配，支持崩溃半截尾行恢复与压缩）和 IndexedDB 后端，所有后端共用同一套契约测试。当前不支持多个进程并发写同一会话。
 
 - **提交粒度（Run 级）**：开始运行前，保存用户输入和 `running` 状态，保存失败就不启动运行；运行结束后，将完整消息和最终状态一次提交。流式事件可提前展示，但不代表已经持久化。这是第一版为简化原子边界的有意取舍——崩溃时不会产生半截工具调用，代价是同一次 run 中已完成的中间工具轮次也会回退。
 - **终态判定与取消**：`pi-agent-core` 会把模型错误和取消编码在末尾 `AssistantMessage.stopReason`（`"error" | "aborted"`）中，而不会让 `prompt()` reject。harness 根据取消状态与末尾 `stopReason` 写入最终状态（`idle` / `aborted` / `error`），过滤无内容且无错误信息的空 `aborted` 尾消息；保留的非空 `aborted` / `error` 消息可供宿主展示，后续请求依赖 `pi-ai` 的 `transformMessages` 自动跳过它们。`abort()` 记录启动前取消意图并等待本轮 settle 与最终保存完成后返回。
