@@ -1,7 +1,7 @@
 {
-  "name": "pi-harness",
+  "name": "pilite",
   "version": "0.1.0",
-  "description": "Lightweight headless agent harness built on pi-agent-core and pi-ai",
+  "description": "PiLite — lightweight, embeddable, headless TypeScript agent harness built on pi-agent-core and pi-ai",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

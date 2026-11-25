@@ -29,7 +29,7 @@ registerSessionStoreContract(
   { describe, it, expect },
   "SqliteSessionStore (bun:sqlite file-backed)",
   async (use) => {
-    const dir = await mkdtemp(join(tmpdir(), "pi-harness-bun-sqlite-"));
+    const dir = await mkdtemp(join(tmpdir(), "pilite-bun-sqlite-"));
     const dbPath = join(dir, "sessions.sqlite");
     const store = await openBunSqliteSessionStore(dbPath);
     try {
@@ -43,7 +43,7 @@ registerSessionStoreContract(
 
 describe("SqliteSessionStore (bun:sqlite specifics)", () => {
   it("persists across close/reopen and supports prefix isolation", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "pi-harness-bun-reopen-"));
+    const dir = await mkdtemp(join(tmpdir(), "pilite-bun-reopen-"));
     const dbPath = join(dir, "shared.sqlite");
     const snap: SessionSnapshot = {
       version: SESSION_SNAPSHOT_VERSION,

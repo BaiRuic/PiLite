@@ -11,7 +11,7 @@ import { registerSessionStoreContract } from "../src/testing.js";
 import { SESSION_SNAPSHOT_VERSION, type SessionSnapshot } from "../src/types.js";
 
 registerSessionStoreContract({ describe, it, expect }, "JsonlSessionStore (node:fs)", async (use) => {
-  const dir = await mkdtemp(join(tmpdir(), "pi-harness-jsonl-"));
+  const dir = await mkdtemp(join(tmpdir(), "pilite-jsonl-"));
   const store = await openNodeJsonlSessionStore(dir);
   try {
     await use(store);
@@ -38,7 +38,7 @@ function makeSnapshot(
 
 describe("JsonlSessionStore (crash tolerance, compaction, and readOnly mode)", () => {
   it("recovers from a torn final line by truncating in writable mode and skipping in readOnly mode", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "pi-harness-jsonl-torn-"));
+    const dir = await mkdtemp(join(tmpdir(), "pilite-jsonl-torn-"));
     try {
       const writer = await openNodeJsonlSessionStore(dir, { fsync: true });
       const snap1 = makeSnapshot("torn-session", "running", 100);
@@ -80,7 +80,7 @@ describe("JsonlSessionStore (crash tolerance, compaction, and readOnly mode)", (
   });
 
   it("throws JsonlCorruptionError when a non-final line is corrupt", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "pi-harness-jsonl-corrupt-"));
+    const dir = await mkdtemp(join(tmpdir(), "pilite-jsonl-corrupt-"));
     try {
       const store = await openNodeJsonlSessionStore(dir);
       const snap = makeSnapshot("bad-mid", "idle", 1);
@@ -102,7 +102,7 @@ describe("JsonlSessionStore (crash tolerance, compaction, and readOnly mode)", (
   });
 
   it("compacts session files automatically at threshold and encodes unsafe session IDs safely", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "pi-harness-jsonl-compact-"));
+    const dir = await mkdtemp(join(tmpdir(), "pilite-jsonl-compact-"));
     try {
       const store = await openNodeJsonlSessionStore(dir, { compactAfterLines: 3 });
       const weirdId = "../team/session:1";

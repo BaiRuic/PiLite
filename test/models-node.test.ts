@@ -12,7 +12,7 @@ import {
 import { registerCredentialStoreContract, registerModelsStoreContract } from "../src/testing.js";
 
 registerCredentialStoreContract({ describe, it, expect }, "FileCredentialStore (node:fs)", async (use) => {
-  const dir = await mkdtemp(join(tmpdir(), "pi-harness-file-cred-"));
+  const dir = await mkdtemp(join(tmpdir(), "pilite-file-cred-"));
   try {
     await use(new FileCredentialStore(join(dir, "auth.json")));
   } finally {
@@ -21,7 +21,7 @@ registerCredentialStoreContract({ describe, it, expect }, "FileCredentialStore (
 });
 
 registerModelsStoreContract({ describe, it, expect }, "FileModelsStore (node:fs)", async (use) => {
-  const dir = await mkdtemp(join(tmpdir(), "pi-harness-file-models-"));
+  const dir = await mkdtemp(join(tmpdir(), "pilite-file-models-"));
   try {
     await use(new FileModelsStore(join(dir, "models-store.json")));
   } finally {
@@ -31,7 +31,7 @@ registerModelsStoreContract({ describe, it, expect }, "FileModelsStore (node:fs)
 
 describe("createJsonFileModelSource (JSON/JSONC)", () => {
   it("loads JSONC with comments and BOM, and returns empty config on missing optional file", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "pi-harness-models-json-"));
+    const dir = await mkdtemp(join(tmpdir(), "pilite-models-json-"));
     try {
       const missingPath = join(dir, "missing.json");
       const optionalSource = createJsonFileModelSource(missingPath);

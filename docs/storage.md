@@ -18,7 +18,7 @@ Each backend is exported on its own subpath to isolate runtime-specific imports 
 
 | Backend | Subpath | Notes | Source |
 | --- | --- | --- | --- |
-| Memory | `pi-harness/storage/memory` | In-memory `Map` with defensive cloning; ideal for tests and ephemeral hosts | [src/store/memory.ts](../src/store/memory.ts) |
-| SQLite | `pi-harness/storage/sqlite` (+ `/node`, `/bun`) | Thin `SqliteDatabase` adapter isolating `node:sqlite` and `bun:sqlite`, schema migrations, table prefixes, native SQL pagination, zero native C++ addons | [src/store/sqlite/](../src/store/sqlite/) |
-| JSONL | `pi-harness/storage/jsonl` (+ `/node`) | Portable `JsonlFileSystem` core + `node:fs` adapter; append-only snapshots with truncated-tail recovery and log compaction | [src/store/jsonl/](../src/store/jsonl/) |
-| IndexedDB | `pi-harness/storage/indexeddb` | Browser / Web Worker persistence with zero Node globals | [src/store/indexeddb.ts](../src/store/indexeddb.ts) |
+| Memory | `pilite/storage/memory` | In-memory `Map` with defensive cloning; ideal for tests and ephemeral hosts | [src/store/memory.ts](../src/store/memory.ts) |
+| SQLite | `pilite/storage/sqlite` (+ `/node`, `/bun`) | Thin `SqliteDatabase` adapter isolating `node:sqlite` and `bun:sqlite`, schema migrations, table prefixes, native SQL pagination, zero native C++ addons | [src/store/sqlite/](../src/store/sqlite/) |
+| JSONL | `pilite/storage/jsonl` (+ `/node`) | Portable `JsonlFileSystem` core + `node:fs` adapter; append-only snapshots with truncated-tail recovery and log compaction | [src/store/jsonl/](../src/store/jsonl/) |
+| IndexedDB | `pilite/storage/indexeddb` | Browser / Web Worker persistence with zero Node globals | [src/store/indexeddb.ts](../src/store/indexeddb.ts) |

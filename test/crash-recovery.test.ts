@@ -45,7 +45,7 @@ function runWorker(
 
 describe("SQLite persistence and hard-kill crash recovery", () => {
   it("reopens a normally exited session and applies updated systemPrompt on follow-up", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "pi-harness-normal-"));
+    const dir = await mkdtemp(join(tmpdir(), "pilite-normal-"));
     const dbPath = join(dir, "session.sqlite");
     try {
       const outcome = await runWorker(["normal", dbPath, "sess-normal"]);
@@ -95,7 +95,7 @@ describe("SQLite persistence and hard-kill crash recovery", () => {
   });
 
   it("marks a session interrupted without auto-replay after hard kill mid-stream", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "pi-harness-crash-stream-"));
+    const dir = await mkdtemp(join(tmpdir(), "pilite-crash-stream-"));
     const dbPath = join(dir, "session.sqlite");
     try {
       const outcome = await runWorker(["crash-stream", dbPath, "sess-stream-crash"], {
@@ -133,7 +133,7 @@ describe("SQLite persistence and hard-kill crash recovery", () => {
   });
 
   it("marks a session interrupted without dangling tool calls after hard kill mid-tool", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "pi-harness-crash-tool-"));
+    const dir = await mkdtemp(join(tmpdir(), "pilite-crash-tool-"));
     const dbPath = join(dir, "session.sqlite");
     try {
       const outcome = await runWorker(["crash-tool", dbPath, "sess-tool-crash"], {

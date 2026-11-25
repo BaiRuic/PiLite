@@ -5,7 +5,7 @@
  * - `bun:sqlite` via `openBunSqliteSessionStore`
  * - streaming events, a host-injected read-only tool, and cancellation
  * - reopen after normal exit and after a simulated `running` crash
- * - optional real provider smoke test when `PI_HARNESS_REAL_PROVIDER=openai|anthropic`
+ * - optional real provider smoke test when `PILITE_REAL_PROVIDER=openai|anthropic`
  */
 
 import { mkdtemp, rm } from "node:fs/promises";
@@ -149,16 +149,16 @@ async function runRealProviderSmoke(dbPath: string, providerName: string): Promi
     models.setProvider(openaiProvider());
     modelRef = {
       provider: "openai",
-      modelId: process.env.PI_HARNESS_MODEL ?? "gpt-4.1-mini",
+      modelId: process.env.PILITE_MODEL ?? "gpt-4.1-mini",
     };
   } else if (providerName === "anthropic") {
     models.setProvider(anthropicProvider());
     modelRef = {
       provider: "anthropic",
-      modelId: process.env.PI_HARNESS_MODEL ?? "claude-sonnet-4-6",
+      modelId: process.env.PILITE_MODEL ?? "claude-sonnet-4-6",
     };
   } else {
-    throw new Error(`Unsupported PI_HARNESS_REAL_PROVIDER: ${providerName}`);
+    throw new Error(`Unsupported PILITE_REAL_PROVIDER: ${providerName}`);
   }
 
   const store = await openBunSqliteSessionStore(dbPath);
@@ -187,11 +187,11 @@ async function runRealProviderSmoke(dbPath: string, providerName: string): Promi
   }
 }
 
-const tempDir = await mkdtemp(join(tmpdir(), "pi-harness-bun-verify-"));
+const tempDir = await mkdtemp(join(tmpdir(), "pilite-bun-verify-"));
 const dbPath = join(tempDir, "verify.sqlite");
 try {
   await runOfflineVerification(dbPath);
-  const realProvider = process.env.PI_HARNESS_REAL_PROVIDER;
+  const realProvider = process.env.PILITE_REAL_PROVIDER;
   if (realProvider) {
     await runRealProviderSmoke(join(tempDir, "real.sqlite"), realProvider);
   }

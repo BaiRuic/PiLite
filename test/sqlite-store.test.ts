@@ -24,7 +24,7 @@ registerSessionStoreContract(
   { describe, it, expect },
   "SqliteSessionStore (node:sqlite file-backed)",
   async (use) => {
-    const dir = await mkdtemp(join(tmpdir(), "pi-harness-sqlite-"));
+    const dir = await mkdtemp(join(tmpdir(), "pilite-sqlite-"));
     const dbPath = join(dir, "sessions.sqlite");
     const store = await openNodeSqliteSessionStore(dbPath);
     try {
@@ -38,7 +38,7 @@ registerSessionStoreContract(
 
 describe("SqliteSessionStore (node:sqlite specifics)", () => {
   it("persists snapshots across close and reopen on disk", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "pi-harness-reopen-"));
+    const dir = await mkdtemp(join(tmpdir(), "pilite-reopen-"));
     const dbPath = join(dir, "nested", "state.sqlite");
     const snapshot: SessionSnapshot = {
       version: SESSION_SNAPSHOT_VERSION,
@@ -70,7 +70,7 @@ describe("SqliteSessionStore (node:sqlite specifics)", () => {
     expect(() => validateSqliteSchemaPrefix("1bad")).toThrow(/invalid/i);
     expect(() => validateSqliteSchemaPrefix("bad-name")).toThrow(/invalid/i);
 
-    const dir = await mkdtemp(join(tmpdir(), "pi-harness-prefix-"));
+    const dir = await mkdtemp(join(tmpdir(), "pilite-prefix-"));
     const dbPath = join(dir, "shared.sqlite");
     try {
       const storeA = await openNodeSqliteSessionStore(dbPath, { prefix: "app_a_" });

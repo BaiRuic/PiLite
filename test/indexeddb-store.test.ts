@@ -9,7 +9,7 @@ registerSessionStoreContract(
   "IndexedDbSessionStore (fake-indexeddb)",
   async (use) => {
     const factory = new IDBFactory();
-    const store = await IndexedDbSessionStore.open("pi-harness-contract", {
+    const store = await IndexedDbSessionStore.open("pilite-contract", {
       indexedDB: factory,
     });
     try {
