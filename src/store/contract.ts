@@ -3,12 +3,10 @@ import { SESSION_SNAPSHOT_VERSION, type SessionSnapshot, type SessionStore } fro
 export interface SessionStoreContractRunner {
   describe(name: string, fn: () => void): void;
   it(name: string, fn: () => Promise<void> | void): void;
-  expect: {
-    (actual: unknown): {
-      toBe(expected: unknown): void;
-      toBeNull(): void;
-      toEqual(expected: unknown): void;
-    };
+  expect: (actual: unknown) => {
+    toBe(expected: unknown): void;
+    toBeNull(): void;
+    toEqual(expected: unknown): void;
   };
 }
 

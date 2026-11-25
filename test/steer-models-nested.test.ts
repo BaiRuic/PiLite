@@ -1,18 +1,14 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { contentText, createModels, type Models } from "@earendil-works/pi-ai";
-import {
-  fauxAssistantMessage,
-  fauxProvider,
-  fauxToolCall,
-} from "@earendil-works/pi-ai/providers/faux";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { obj, str } from "@earendil-works/pi-schema";
 import { describe, expect, it } from "vitest";
 import {
-  HarnessError,
-  InMemorySessionStore,
   createSession,
   defineTool,
   type ExtensionFactory,
+  HarnessError,
+  InMemorySessionStore,
 } from "../src/index.js";
 
 function createFauxModels(modelId = "faux-1", tokensPerSecond?: number) {
@@ -206,11 +202,7 @@ describe("Running-turn steer() and followUp()", () => {
 
     let aborted = false;
     const unsub = session.subscribe((event) => {
-      if (
-        !aborted &&
-        event.type === "message_update" &&
-        event.assistantMessageEvent.type === "text_delta"
-      ) {
+      if (!aborted && event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
         aborted = true;
         session.followUp("Should be discarded on abort");
         expect(session.hasQueuedMessages()).toBe(true);
@@ -260,7 +252,12 @@ describe("Nested tool execution via ctx.executeTool()", () => {
           execute: async (_id, params, _signal, _onUpdate, ctx) => {
             const nested = await ctx.executeTool("secret_lookup", { key: params.key });
             return {
-              content: [{ type: "text", text: `nested(isError=${nested.isError}):${contentText(nested.result.content)}` }],
+              content: [
+                {
+                  type: "text",
+                  text: `nested(isError=${nested.isError}):${contentText(nested.result.content)}`,
+                },
+              ],
               details: { nestedError: nested.isError },
             };
           },
@@ -279,6 +276,7 @@ describe("Nested tool execution via ctx.executeTool()", () => {
         if (event.toolName === "secret_lookup" && event.input.key === "forbidden") {
           return { block: true, reason: "Key is forbidden by policy" };
         }
+        return undefined;
       });
 
       pi.on("tool_result", (event) => {
@@ -292,6 +290,7 @@ describe("Nested tool execution via ctx.executeTool()", () => {
             content: [{ type: "text", text: contentText(event.content).replace("TOP_SECRET", "[REDACTED]") }],
           };
         }
+        return undefined;
       });
     };
 

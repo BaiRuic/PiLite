@@ -2,14 +2,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import {
-  SqliteSessionStore,
-  validateSqliteSchemaPrefix,
-} from "../src/store/sqlite/index.js";
-import {
-  openNodeSqliteDatabase,
-  openNodeSqliteSessionStore,
-} from "../src/store/sqlite/node.js";
+import { SqliteSessionStore, validateSqliteSchemaPrefix } from "../src/store/sqlite/index.js";
+import { openNodeSqliteDatabase, openNodeSqliteSessionStore } from "../src/store/sqlite/node.js";
 import { registerSessionStoreContract } from "../src/testing.js";
 import { SESSION_SNAPSHOT_VERSION, type SessionSnapshot } from "../src/types.js";
 
@@ -50,9 +44,7 @@ describe("SqliteSessionStore (node:sqlite specifics)", () => {
       version: SESSION_SNAPSHOT_VERSION,
       sessionId: "persisted-1",
       model: { provider: "faux", modelId: "faux-1" },
-      messages: [
-        { role: "user", content: [{ type: "text", text: "remember me" }], timestamp: 100 },
-      ],
+      messages: [{ role: "user", content: [{ type: "text", text: "remember me" }], timestamp: 100 }],
       status: "running",
       updatedAt: 100,
     };

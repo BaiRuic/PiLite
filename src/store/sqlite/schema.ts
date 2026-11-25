@@ -1,4 +1,4 @@
-import { validateSqliteSchemaPrefix, type SqliteDatabase, type SqliteExecutor } from "./database.js";
+import { type SqliteDatabase, type SqliteExecutor, validateSqliteSchemaPrefix } from "./database.js";
 
 export const CURRENT_SQLITE_SCHEMA_VERSION = 2;
 
@@ -66,10 +66,7 @@ export const SQLITE_MIGRATIONS: readonly SqliteMigration[] = [
 
 type MigrationRow = { readonly version: number };
 
-export async function applySqliteMigrations(
-  db: SqliteDatabase,
-  schema: SqliteSessionSchema,
-): Promise<void> {
+export async function applySqliteMigrations(db: SqliteDatabase, schema: SqliteSessionSchema): Promise<void> {
   await db.transaction(async (tx) => {
     await tx.exec(`
       CREATE TABLE IF NOT EXISTS ${schema.tables.schemaMigrations} (

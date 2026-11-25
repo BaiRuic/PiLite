@@ -1,7 +1,7 @@
 import {
-  validateSqliteSchemaPrefix,
   type SqliteDatabase,
   type SqliteExecutor,
+  validateSqliteSchemaPrefix,
 } from "../../store/sqlite/database.js";
 
 export interface SqliteModelsSchema {

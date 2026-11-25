@@ -82,11 +82,7 @@ const session = await createSession({
 if (mode === "crash-stream") {
   let announced = false;
   session.subscribe((event) => {
-    if (
-      !announced &&
-      event.type === "message_update" &&
-      event.assistantMessageEvent.type === "text_delta"
-    ) {
+    if (!announced && event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
       announced = true;
       process.stdout.write("READY_TO_KILL\n");
     }

@@ -1,18 +1,16 @@
 export {
-  estimateMessageTokens,
-  estimateTranscriptTokens,
-  isSafeForkBoundary,
-  planCompaction,
   type CompactionOptions,
   type CompactionPlan,
   type CompactionRequestOptions,
   type CompactionResult,
   type CompactionSummarizer,
   type CompactionSummarizerInput,
+  estimateMessageTokens,
+  estimateTranscriptTokens,
+  isSafeForkBoundary,
+  planCompaction,
 } from "./compaction.js";
 export {
-  defineTool,
-  ExtensionRunner,
   type AfterProviderResponseEvent,
   type BeforeAgentStartEvent,
   type BeforeAgentStartResult,
@@ -20,6 +18,7 @@ export {
   type BeforeProviderRequestResult,
   type ContextExtensionEvent,
   type ContextExtensionResult,
+  defineTool,
   type ExecuteToolOptions,
   type ExtensionAPI,
   type ExtensionContext,
@@ -35,6 +34,7 @@ export {
   type ExtensionFactory,
   type ExtensionHostBindings,
   type ExtensionRegistration,
+  ExtensionRunner,
   type ExtensionToolDefinition,
   type ExtensionUIAdapter,
   type ExtensionUIContext,
@@ -46,30 +46,28 @@ export {
   type ToolResultExtensionEvent,
   type ToolResultExtensionResult,
 } from "./extensions/index.js";
-export { HarnessSession, createSession, openSession } from "./session.js";
+export { createSession, HarnessSession, openSession } from "./session.js";
 export { InMemorySessionStore } from "./store/memory.js";
 export {
+  type DecodedSessionCursor,
   decodeSessionCursor,
   encodeSessionCursor,
   filterAndPaginateSummaries,
   validateSessionListQuery,
-  type DecodedSessionCursor,
 } from "./store/query.js";
 export {
-  HarnessError,
-  SESSION_SNAPSHOT_VERSION,
-  sortSessionSummaries,
-  summarizeSnapshot,
   type BaseSessionOptions,
   type CreateSessionOptions,
   type CustomSessionEntry,
   type ForkSessionOptions,
+  HarnessError,
   type HarnessErrorCode,
   type ModelRef,
   type ModelsProvider,
   type OpenSessionOptions,
   type RetryEvent,
   type RetryOptions,
+  SESSION_SNAPSHOT_VERSION,
   type SessionEventListener,
   type SessionListPage,
   type SessionListQuery,
@@ -80,4 +78,6 @@ export {
   type SessionStore,
   type SessionSummary,
   type SessionTerminalStatus,
+  sortSessionSummaries,
+  summarizeSnapshot,
 } from "./types.js";

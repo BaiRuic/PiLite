@@ -1,31 +1,25 @@
 import {
+  type AuthInteraction,
   contentText,
   createProvider,
   hasApi,
-  type AuthInteraction,
   type OAuthCredential,
 } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai/providers/faux";
 import { describe, expect, it } from "vitest";
-import { HarnessError, InMemorySessionStore, createSession } from "../src/index.js";
+import { createSession, HarnessError, InMemorySessionStore } from "../src/index.js";
 import {
   createApiBackendProvider,
   createModelHub,
   createStaticLocalModelSource,
-  resolveConfigValue,
   type LocalModelSource,
   type LocalModelsConfig,
+  resolveConfigValue,
 } from "../src/models/index.js";
-import {
-  createSqliteCredentialStore,
-  createSqliteModelsStore,
-} from "../src/models/sqlite/index.js";
+import { createSqliteCredentialStore, createSqliteModelsStore } from "../src/models/sqlite/index.js";
 import { SqliteSessionStore } from "../src/store/sqlite/index.js";
 import { openNodeSqliteDatabase } from "../src/store/sqlite/node.js";
-import {
-  registerCredentialStoreContract,
-  registerModelsStoreContract,
-} from "../src/testing.js";
+import { registerCredentialStoreContract, registerModelsStoreContract } from "../src/testing.js";
 
 registerCredentialStoreContract(
   { describe, it, expect },
@@ -54,10 +48,12 @@ registerModelsStoreContract(
 );
 
 describe("Config value resolution ($ENV & opt-in !command)", () => {
+  // biome-ignore lint/suspicious/noTemplateCurlyInString: intentionally tests literal ${VAR} syntax
   it("interpolates $VAR / ${VAR}, supports escaping, and disables !command by default", async () => {
     const env = { API_TOKEN: "tok-123", REGION: "us" };
 
     expect(await resolveConfigValue("Bearer $API_TOKEN", { env })).toBe("Bearer tok-123");
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: intentionally tests literal ${REGION} interpolation
     expect(await resolveConfigValue("https://${REGION}.example.com", { env })).toBe("https://us.example.com");
     expect(await resolveConfigValue("$$literal-$!bang", { env })).toBe("$literal-!bang");
     expect(await resolveConfigValue("$MISSING_VAR", { env })).toBe(undefined);
@@ -273,10 +269,7 @@ describe("ModelHub: OAuth login, custom JWT backend, local sources, and hot-swap
       provider: "faux",
       models: [{ id: "faux-1", contextWindow: 32_000 }],
     });
-    faux.setResponses([
-      fauxAssistantMessage("before reload"),
-      fauxAssistantMessage("after reload"),
-    ]);
+    faux.setResponses([fauxAssistantMessage("before reload"), fauxAssistantMessage("after reload")]);
 
     let localConfig: LocalModelsConfig = {
       providers: {
@@ -368,8 +361,8 @@ describe("ModelHub: OAuth login, custom JWT backend, local sources, and hot-swap
   });
 
   it("rejects empty provider IDs cleanly with HarnessError", () => {
-    expect(() =>
-      createApiBackendProvider({ id: " ", baseUrl: "https://example.com/v1" }),
-    ).toThrow(HarnessError);
+    expect(() => createApiBackendProvider({ id: " ", baseUrl: "https://example.com/v1" })).toThrow(
+      HarnessError,
+    );
   });
 });

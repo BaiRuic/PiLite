@@ -1,7 +1,7 @@
 export {
+  type CliAuthInteractionOptions,
   createCliAuthInteraction,
   openUrlInBrowser,
-  type CliAuthInteractionOptions,
 } from "./cli-auth.js";
 export { FileCredentialStore, FileModelsStore } from "./file-stores.js";
 export {

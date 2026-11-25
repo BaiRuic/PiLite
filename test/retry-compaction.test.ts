@@ -1,18 +1,9 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { createModels } from "@earendil-works/pi-ai";
-import {
-  fauxAssistantMessage,
-  fauxProvider,
-  fauxToolCall,
-} from "@earendil-works/pi-ai/providers/faux";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { obj, str } from "@earendil-works/pi-schema";
 import { describe, expect, it } from "vitest";
-import {
-  InMemorySessionStore,
-  createSession,
-  openSession,
-  type RetryEvent,
-} from "../src/index.js";
+import { createSession, InMemorySessionStore, openSession, type RetryEvent } from "../src/index.js";
 
 function createTestEnv(contextWindow = 100_000) {
   const faux = fauxProvider({
@@ -133,8 +124,8 @@ describe("Auto-retry and context compaction", () => {
     };
 
     faux.setResponses([
-      fauxAssistantMessage("Turn 1 answer: " + "x".repeat(400)),
-      fauxAssistantMessage("Turn 2 answer: " + "y".repeat(400)),
+      fauxAssistantMessage(`Turn 1 answer: ${"x".repeat(400)}`),
+      fauxAssistantMessage(`Turn 2 answer: ${"y".repeat(400)}`),
       fauxAssistantMessage(fauxToolCall("lookup", { k: "recent" }, { id: "tc-keep" }), {
         stopReason: "toolUse",
       }),
@@ -152,8 +143,8 @@ describe("Auto-retry and context compaction", () => {
       tools: [lookupTool],
     });
 
-    await session.prompt("Turn 1 question " + "a".repeat(200));
-    await session.prompt("Turn 2 question " + "b".repeat(200));
+    await session.prompt(`Turn 1 question ${"a".repeat(200)}`);
+    await session.prompt(`Turn 2 question ${"b".repeat(200)}`);
     await session.prompt("Lookup recent");
 
     const compacted = await session.compact({ keepRecentTokens: 60 });
@@ -167,7 +158,9 @@ describe("Auto-retry and context compaction", () => {
     const roles = persisted.getSnapshot().messages.map((m) => m.role);
     expect(roles[0]).toBe("system");
     expect(roles[1]).toBe("user"); // <conversation_summary>
-    expect(persisted.getSnapshot().customEntries?.some((e) => e.customType === "harness.compaction")).toBe(true);
+    expect(persisted.getSnapshot().customEntries?.some((e) => e.customType === "harness.compaction")).toBe(
+      true,
+    );
   });
 
   it("supports automatic threshold compaction and overflow recovery", async () => {
@@ -176,8 +169,8 @@ describe("Auto-retry and context compaction", () => {
 
     // 1. Threshold compaction: tiny contextWindow (300) with reserveTokens (100) triggers auto-compact before turn 3.
     faux.setResponses([
-      fauxAssistantMessage("Answer 1 " + "a".repeat(300)),
-      fauxAssistantMessage("Answer 2 " + "b".repeat(300)),
+      fauxAssistantMessage(`Answer 1 ${"a".repeat(300)}`),
+      fauxAssistantMessage(`Answer 2 ${"b".repeat(300)}`),
       fauxAssistantMessage("Answer 3 after threshold compaction"),
     ]);
 
@@ -198,8 +191,8 @@ describe("Auto-retry and context compaction", () => {
       },
     });
 
-    await s1.prompt("First " + "q".repeat(120));
-    await s1.prompt("Second " + "q".repeat(120));
+    await s1.prompt(`First ${"q".repeat(120)}`);
+    await s1.prompt(`Second ${"q".repeat(120)}`);
     const r3 = await s1.prompt("Third");
 
     expect(r3.status).toBe("idle");
@@ -209,7 +202,7 @@ describe("Auto-retry and context compaction", () => {
     // 2. Context overflow recovery: provider returns prompt-too-long error -> compacts once and retries.
     const overflowSummaries: number[] = [];
     faux.setResponses([
-      fauxAssistantMessage("Earlier detailed answer " + "y".repeat(80)),
+      fauxAssistantMessage(`Earlier detailed answer ${"y".repeat(80)}`),
       fauxAssistantMessage([], {
         stopReason: "error",
         errorMessage: "prompt is too long: 210000 tokens > 200000 maximum",
@@ -234,14 +227,15 @@ describe("Auto-retry and context compaction", () => {
       },
     });
 
-    await s2.prompt("Earlier detailed question " + "x".repeat(80));
+    await s2.prompt(`Earlier detailed question ${"x".repeat(80)}`);
     const recovered = await s2.prompt("Trigger overflow");
 
     expect(recovered.status).toBe("idle");
     expect(overflowSummaries).toEqual([2]);
     expect(
       recovered.snapshot.customEntries?.some(
-        (e) => e.customType === "harness.compaction" && (e.data as { trigger?: string })?.trigger === "overflow",
+        (e) =>
+          e.customType === "harness.compaction" && (e.data as { trigger?: string })?.trigger === "overflow",
       ),
     ).toBe(true);
   });

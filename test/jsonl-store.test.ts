@@ -10,29 +10,27 @@ import {
 import { registerSessionStoreContract } from "../src/testing.js";
 import { SESSION_SNAPSHOT_VERSION, type SessionSnapshot } from "../src/types.js";
 
-registerSessionStoreContract(
-  { describe, it, expect },
-  "JsonlSessionStore (node:fs)",
-  async (use) => {
-    const dir = await mkdtemp(join(tmpdir(), "pi-harness-jsonl-"));
-    const store = await openNodeJsonlSessionStore(dir);
-    try {
-      await use(store);
-    } finally {
-      await store.close();
-      await rm(dir, { recursive: true, force: true });
-    }
-  },
-);
+registerSessionStoreContract({ describe, it, expect }, "JsonlSessionStore (node:fs)", async (use) => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-harness-jsonl-"));
+  const store = await openNodeJsonlSessionStore(dir);
+  try {
+    await use(store);
+  } finally {
+    await store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
-function makeSnapshot(sessionId: string, status: SessionSnapshot["status"], updatedAt: number): SessionSnapshot {
+function makeSnapshot(
+  sessionId: string,
+  status: SessionSnapshot["status"],
+  updatedAt: number,
+): SessionSnapshot {
   return {
     version: SESSION_SNAPSHOT_VERSION,
     sessionId,
     model: { provider: "faux", modelId: "faux-1" },
-    messages: [
-      { role: "user", content: [{ type: "text", text: `msg-${updatedAt}` }], timestamp: updatedAt },
-    ],
+    messages: [{ role: "user", content: [{ type: "text", text: `msg-${updatedAt}` }], timestamp: updatedAt }],
     status,
     updatedAt,
   };
@@ -90,7 +88,11 @@ describe("JsonlSessionStore (crash tolerance, compaction, and readOnly mode)", (
 
       const filePath = join(dir, "bad-mid.jsonl");
       await appendFile(filePath, "not-json\n", "utf8");
-      await appendFile(filePath, `${JSON.stringify({ format: 1, type: "snapshot", snapshot: snap })}\n`, "utf8");
+      await appendFile(
+        filePath,
+        `${JSON.stringify({ format: 1, type: "snapshot", snapshot: snap })}\n`,
+        "utf8",
+      );
 
       await expect(store.load("bad-mid")).rejects.toBeInstanceOf(JsonlCorruptionError);
       await store.close();

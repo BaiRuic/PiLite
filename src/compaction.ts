@@ -1,10 +1,10 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
-  contentText,
-  getCurrentSystemMessage,
   type Api,
   type ClientIdentity,
   type Context,
+  contentText,
+  getCurrentSystemMessage,
   type Model,
   type Models,
   type SystemMessage,
@@ -187,7 +187,8 @@ function renderMessagesForSummary(messages: readonly AgentMessage[]): string {
       const parts: string[] = [];
       for (const block of message.content) {
         if (block.type === "text" && block.text.trim()) parts.push(block.text.trim());
-        else if (block.type === "toolCall") parts.push(`[toolCall ${block.name}(${JSON.stringify(block.arguments)})]`);
+        else if (block.type === "toolCall")
+          parts.push(`[toolCall ${block.name}(${JSON.stringify(block.arguments)})]`);
       }
       if (parts.length > 0) lines.push(`Assistant: ${parts.join("\n")}`);
     } else if (message.role === "toolResult") {

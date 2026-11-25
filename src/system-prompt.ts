@@ -1,9 +1,9 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
   getCurrentSystemPrompt,
-  toToolDeclaration,
   type SystemMessage,
   type Tool,
+  toToolDeclaration,
 } from "@earendil-works/pi-ai";
 
 const SYSTEM_PROMPT_SECTION = "system";

@@ -1,5 +1,4 @@
 import {
-  createModels,
   type AnyModel,
   type Api,
   type AuthCheck,
@@ -11,6 +10,7 @@ import {
   type ClientIdentity,
   type Credential,
   type CredentialStore,
+  createModels,
   type LoginOptions,
   type Model,
   type Models,
@@ -31,9 +31,9 @@ import {
 } from "./embedding.js";
 import {
   composeLocalProvider,
-  mergeLocalModelsConfigs,
   type LocalModelSource,
   type LocalModelsConfig,
+  mergeLocalModelsConfigs,
 } from "./local.js";
 
 export interface CreateModelHubOptions {
@@ -296,9 +296,7 @@ export class ModelHub {
   createEmbeddingProvider(
     providerId: string,
     modelId: string,
-    overrides: Partial<
-      Omit<OpenAIEmbeddingProviderOptions, "modelId" | "authFrom" | "model">
-    > = {},
+    overrides: Partial<Omit<OpenAIEmbeddingProviderOptions, "modelId" | "authFrom" | "model">> = {},
   ): EmbeddingProvider {
     const known = this.getEmbeddingModel(providerId, modelId);
     const registeredProvider = this.activeModels.getProvider(providerId);

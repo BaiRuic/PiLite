@@ -2,10 +2,10 @@ import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import {
   SerialOperationQueue,
-  validateSqliteSchemaPrefix,
   type SqliteDatabase,
   type SqliteExecutor,
   type SqliteValue,
+  validateSqliteSchemaPrefix,
 } from "./database.js";
 import { SqliteSessionStore, type SqliteSessionStoreOptions } from "./store.js";
 

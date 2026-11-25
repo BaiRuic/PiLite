@@ -40,10 +40,7 @@ function writeLine(output: Writable, text: string): void {
   output.write(`${text}\n`);
 }
 
-function combineSignals(
-  a: AbortSignal | undefined,
-  b: AbortSignal | undefined,
-): AbortSignal | undefined {
+function combineSignals(a: AbortSignal | undefined, b: AbortSignal | undefined): AbortSignal | undefined {
   if (a && b) return AbortSignal.any([a, b]);
   return a ?? b;
 }
@@ -132,9 +129,7 @@ async function readSecretPrompt(
  * Create a lightweight CLI `AuthInteraction` bridge for `models.login()` / `hub.login()`.
  * Works with all built-in `pi-ai` OAuth & API-key login flows using pure `node:readline`.
  */
-export function createCliAuthInteraction(
-  options: CliAuthInteractionOptions = {},
-): AuthInteraction {
+export function createCliAuthInteraction(options: CliAuthInteractionOptions = {}): AuthInteraction {
   const input = options.input ?? process.stdin;
   const output = options.output ?? process.stdout;
   const openBrowser = options.openBrowser ?? true;
@@ -152,10 +147,7 @@ export function createCliAuthInteraction(
           }
           break;
         case "device_code":
-          writeLine(
-            output,
-            `Visit ${event.verificationUri} and enter code: ${event.userCode}`,
-          );
+          writeLine(output, `Visit ${event.verificationUri} and enter code: ${event.userCode}`);
           if (openBrowser && event.openBrowserOnConfirm !== false) {
             void opener(event.verificationUri);
           }

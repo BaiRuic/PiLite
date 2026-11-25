@@ -1,8 +1,8 @@
 import {
-  createProvider,
   type Api,
   type ApiKeyCredential,
   type AuthContext,
+  createProvider,
   type Model,
   type OAuthAuth,
   type Provider,
@@ -12,7 +12,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { HarnessError } from "../types.js";
 import { buildApiStreamMap } from "./api-streams.js";
-import { resolveConfigHeaders, resolveConfigValue, type ConfigValueResolverOptions } from "./config-value.js";
+import { type ConfigValueResolverOptions, resolveConfigHeaders, resolveConfigValue } from "./config-value.js";
 
 export interface BackendAuthResult {
   readonly apiKey?: string;
@@ -55,7 +55,9 @@ export interface ApiBackendProviderOptions {
    * Dynamic auth resolver (ideal for JWT, rotating session tokens, tenant headers, etc.).
    * Invoked on every request and catalog refresh.
    */
-  readonly getAuth?: (ctx: BackendAuthContext) => Promise<BackendAuthResult | undefined> | BackendAuthResult | undefined;
+  readonly getAuth?: (
+    ctx: BackendAuthContext,
+  ) => Promise<BackendAuthResult | undefined> | BackendAuthResult | undefined;
   /** Shorthand API key (literal or `$ENV`) when `getAuth` is not provided. */
   readonly apiKey?: string;
   /** Allow requests without an API key (e.g. trusted internal/local endpoints). Defaults to `false`. */
@@ -92,9 +94,7 @@ function joinUrl(baseUrl: string, endpoint: string): string {
   return `${normalizedBase}${normalizedPath}`;
 }
 
-function mergeCaseInsensitiveHeaders(
-  ...sources: Array<ProviderHeaders | undefined>
-): ProviderHeaders {
+function mergeCaseInsensitiveHeaders(...sources: Array<ProviderHeaders | undefined>): ProviderHeaders {
   const result: ProviderHeaders = {};
   for (const source of sources) {
     if (!source) continue;
@@ -119,15 +119,14 @@ function asPositiveNumber(value: unknown): number | undefined {
  * Default parser supporting standard OpenAI `GET /models` (`{ data: [...] }`),
  * `{ models: [...] }`, or a plain JSON array of model objects.
  */
-export function parseOpenAICompatibleModels(
-  payload: unknown,
-  defaults: ParsedModelDefaults,
-): Model<Api>[] {
+export function parseOpenAICompatibleModels(payload: unknown, defaults: ParsedModelDefaults): Model<Api>[] {
   const rawList = Array.isArray(payload)
     ? payload
     : typeof payload === "object" && payload !== null && Array.isArray((payload as { data?: unknown }).data)
       ? (payload as { data: unknown[] }).data
-      : typeof payload === "object" && payload !== null && Array.isArray((payload as { models?: unknown }).models)
+      : typeof payload === "object" &&
+          payload !== null &&
+          Array.isArray((payload as { models?: unknown }).models)
         ? (payload as { models: unknown[] }).models
         : undefined;
 
@@ -142,8 +141,9 @@ export function parseOpenAICompatibleModels(
     const id = typeof record.id === "string" ? record.id.trim() : "";
     if (!id) continue;
 
-    const api =
-      (typeof record.api === "string" && record.api.trim() ? record.api.trim() : defaults.defaultApi) as Api;
+    const api = (
+      typeof record.api === "string" && record.api.trim() ? record.api.trim() : defaults.defaultApi
+    ) as Api;
     const baseUrl =
       typeof record.baseUrl === "string" && record.baseUrl.trim() ? record.baseUrl.trim() : defaults.baseUrl;
     const name = typeof record.name === "string" && record.name.trim() ? record.name.trim() : id;
@@ -160,11 +160,9 @@ export function parseOpenAICompatibleModels(
       defaults.modelDefaults?.maxTokens ??
       16_384;
     const reasoning =
-      typeof record.reasoning === "boolean"
-        ? record.reasoning
-        : (defaults.modelDefaults?.reasoning ?? false);
+      typeof record.reasoning === "boolean" ? record.reasoning : (defaults.modelDefaults?.reasoning ?? false);
     const input = Array.isArray(record.input)
-      ? (record.input.filter((v): v is "text" | "image" => v === "text" || v === "image"))
+      ? record.input.filter((v): v is "text" | "image" => v === "text" || v === "image")
       : (defaults.modelDefaults?.input ?? ["text"]);
     const costRecord =
       typeof record.cost === "object" && record.cost !== null
@@ -208,7 +206,10 @@ export function createApiBackendProvider(options: ApiBackendProviderOptions): Pr
     throw new HarnessError("INVALID_OPTIONS", "ApiBackendProviderOptions.id must be a non-empty string.");
   }
   if (!options.baseUrl.trim()) {
-    throw new HarnessError("INVALID_OPTIONS", `Provider "${options.id}": baseUrl must be a non-empty string.`);
+    throw new HarnessError(
+      "INVALID_OPTIONS",
+      `Provider "${options.id}": baseUrl must be a non-empty string.`,
+    );
   }
 
   const defaultApi: Api = options.defaultApi ?? "openai-completions";

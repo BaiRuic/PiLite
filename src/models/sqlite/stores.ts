@@ -8,11 +8,7 @@ import type {
   ModelsStoreOperationOptions,
 } from "@earendil-works/pi-ai";
 import type { SqliteDatabase } from "../../store/sqlite/database.js";
-import {
-  applySqliteModelsMigrations,
-  createSqliteModelsSchema,
-  type SqliteModelsSchema,
-} from "./schema.js";
+import { applySqliteModelsMigrations, createSqliteModelsSchema, type SqliteModelsSchema } from "./schema.js";
 
 export interface SqliteModelsStoreOptions {
   /** Optional table prefix so multiple apps/namespaces can share one SQLite DB. */
@@ -112,10 +108,7 @@ export class SqliteCredentialStore implements CredentialStore {
     await this.ensureReady();
     options?.signal?.throwIfAborted();
     await this.db.transaction(async (tx) => {
-      await tx.run(
-        `DELETE FROM ${this.schema.tables.credentials} WHERE provider_id = ?`,
-        providerId,
-      );
+      await tx.run(`DELETE FROM ${this.schema.tables.credentials} WHERE provider_id = ?`, providerId);
     });
   }
 }
@@ -184,10 +177,7 @@ export class SqliteModelsStore implements ModelsStore {
     options?.signal?.throwIfAborted();
     await this.ensureReady();
     options?.signal?.throwIfAborted();
-    await this.db.run(
-      `DELETE FROM ${this.schema.tables.modelsCache} WHERE provider_id = ?`,
-      providerId,
-    );
+    await this.db.run(`DELETE FROM ${this.schema.tables.modelsCache} WHERE provider_id = ?`, providerId);
   }
 }
 

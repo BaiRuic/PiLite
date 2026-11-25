@@ -126,10 +126,7 @@ export class FileModelsStore implements ModelsStore {
     this.filePath = filePath;
   }
 
-  read(
-    providerId: string,
-    options?: ModelsStoreOperationOptions,
-  ): Promise<ModelsStoreEntry | undefined> {
+  read(providerId: string, options?: ModelsStoreOperationOptions): Promise<ModelsStoreEntry | undefined> {
     return this.queue.runAsync(async () => {
       options?.signal?.throwIfAborted();
       const map = await readJsonFile<StoredModelsMap>(this.filePath, {});
@@ -139,11 +136,7 @@ export class FileModelsStore implements ModelsStore {
     });
   }
 
-  write(
-    providerId: string,
-    entry: ModelsStoreEntry,
-    options?: ModelsStoreOperationOptions,
-  ): Promise<void> {
+  write(providerId: string, entry: ModelsStoreEntry, options?: ModelsStoreOperationOptions): Promise<void> {
     return this.queue.runAsync(async () => {
       options?.signal?.throwIfAborted();
       const map = await readJsonFile<StoredModelsMap>(this.filePath, {});

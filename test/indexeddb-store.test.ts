@@ -27,9 +27,7 @@ describe("IndexedDbSessionStore (reopen, custom storeName, and lifecycle)", () =
       version: SESSION_SNAPSHOT_VERSION,
       sessionId: "browser-session-1",
       model: { provider: "faux", modelId: "faux-1" },
-      messages: [
-        { role: "user", content: [{ type: "text", text: "saved in browser" }], timestamp: 500 },
-      ],
+      messages: [{ role: "user", content: [{ type: "text", text: "saved in browser" }], timestamp: 500 }],
       status: "running",
       updatedAt: 500,
     };
@@ -55,9 +53,9 @@ describe("IndexedDbSessionStore (reopen, custom storeName, and lifecycle)", () =
   it("rejects operations after close and validates options", async () => {
     const factory = new IDBFactory();
     await expect(IndexedDbSessionStore.open("  ", { indexedDB: factory })).rejects.toThrow(/non-empty/i);
-    await expect(
-      IndexedDbSessionStore.open("valid", { indexedDB: factory, storeName: "" }),
-    ).rejects.toThrow(/non-empty/i);
+    await expect(IndexedDbSessionStore.open("valid", { indexedDB: factory, storeName: "" })).rejects.toThrow(
+      /non-empty/i,
+    );
 
     const store = await IndexedDbSessionStore.open("close-test", { indexedDB: factory });
     await store.close();

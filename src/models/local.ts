@@ -1,7 +1,7 @@
 import {
-  isModelType,
   type AnyModel,
   type Api,
+  isModelType,
   type Model,
   type Provider,
   type ProviderHeaders,
@@ -9,7 +9,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { HarnessError } from "../types.js";
 import { createApiBackendProvider } from "./backend.js";
-import { resolveConfigHeaders, resolveConfigValue, type ConfigValueResolverOptions } from "./config-value.js";
+import { type ConfigValueResolverOptions, resolveConfigHeaders, resolveConfigValue } from "./config-value.js";
 
 export interface LocalModelDefinition {
   readonly id: string;
@@ -81,10 +81,7 @@ export interface LocalModelSource {
 }
 
 /** Wrap an in-memory `LocalModelsConfig` object as a `LocalModelSource`. */
-export function createStaticLocalModelSource(
-  config: LocalModelsConfig,
-  name = "static",
-): LocalModelSource {
+export function createStaticLocalModelSource(config: LocalModelsConfig, name = "static"): LocalModelSource {
   return {
     name,
     load: () => structuredClone(config),
@@ -97,10 +94,7 @@ const DEFAULT_LOCAL_OPENAI_COMPAT: NonNullable<Model<Api>["compat"]> = {
   maxTokensField: "max_tokens",
 };
 
-function mergeCompat(
-  base: Model<Api>["compat"],
-  override: Model<Api>["compat"],
-): Model<Api>["compat"] {
+function mergeCompat(base: Model<Api>["compat"], override: Model<Api>["compat"]): Model<Api>["compat"] {
   if (!override) return base;
   if (!base) return structuredClone(override);
   return { ...base, ...override } as Model<Api>["compat"];
@@ -281,14 +275,7 @@ function applyProviderLevelOverlays<TModel extends AnyModel>(
 
   const firstChat = next.find((m): m is Model<Api> => isModelType(m, "chat"));
   for (const def of config.models ?? []) {
-    const built = buildStaticModel(
-      providerId,
-      def,
-      config,
-      firstChat?.baseUrl,
-      firstChat?.api,
-      undefined,
-    );
+    const built = buildStaticModel(providerId, def, config, firstChat?.baseUrl, firstChat?.api, undefined);
     const override = config.modelOverrides?.[built.id];
     const finalModel = override ? applyModelOverride(built, override) : built;
     const idx = next.findIndex((m) => isModelType(m, "chat") && m.id === finalModel.id);
@@ -370,7 +357,10 @@ export function composeLocalProvider(
   // Overlay onto an existing (built-in or backend) provider.
   const baseApiKeyAuth = baseProvider.auth.apiKey;
   const wrappedApiKeyAuth =
-    baseApiKeyAuth || config.apiKey !== undefined || config.headers !== undefined || config.baseUrl !== undefined
+    baseApiKeyAuth ||
+    config.apiKey !== undefined ||
+    config.headers !== undefined ||
+    config.baseUrl !== undefined
       ? {
           name: baseApiKeyAuth?.name ?? `${config.name ?? baseProvider.name} API`,
           ...(baseApiKeyAuth?.login ? { login: baseApiKeyAuth.login } : {}),
@@ -402,7 +392,7 @@ export function composeLocalProvider(
                     ? { apiKey: "local" }
                     : {}),
                 ...(mergedHeaders ? { headers: mergedHeaders } : {}),
-                ...(config.baseUrl ?? baseResolved?.auth.baseUrl
+                ...((config.baseUrl ?? baseResolved?.auth.baseUrl)
                   ? { baseUrl: config.baseUrl ?? baseResolved?.auth.baseUrl }
                   : {}),
               },

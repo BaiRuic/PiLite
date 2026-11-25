@@ -8,11 +8,7 @@ import type {
 } from "@earendil-works/pi-ai";
 import { HarnessError } from "../types.js";
 import type { BackendAuthContext, BackendAuthResult } from "./backend.js";
-import {
-  resolveConfigHeaders,
-  resolveConfigValue,
-  type ConfigValueResolverOptions,
-} from "./config-value.js";
+import { type ConfigValueResolverOptions, resolveConfigHeaders, resolveConfigValue } from "./config-value.js";
 
 /** Metadata describing a selectable embedding model. */
 export interface EmbeddingModel {
@@ -103,7 +99,9 @@ function joinUrl(baseUrl: string, endpoint: string): string {
   return `${normalizedBase}${normalizedPath}`;
 }
 
-function mergeHeaders(...sources: Array<ProviderHeaders | Readonly<Record<string, string>> | undefined>): Record<string, string> {
+function mergeHeaders(
+  ...sources: Array<ProviderHeaders | Readonly<Record<string, string>> | undefined>
+): Record<string, string> {
   const merged: Record<string, string> = {};
   for (const source of sources) {
     if (!source) continue;
@@ -169,9 +167,7 @@ async function readBoundedText(response: Response, maxBytes: number): Promise<st
  *
  * Can operate standalone or reuse credentials/headers/baseUrl directly from a `ModelHub` / `Models`.
  */
-export function createOpenAIEmbeddingProvider(
-  options: OpenAIEmbeddingProviderOptions,
-): EmbeddingProvider {
+export function createOpenAIEmbeddingProvider(options: OpenAIEmbeddingProviderOptions): EmbeddingProvider {
   if (!options.modelId.trim()) {
     throw new HarnessError("INVALID_OPTIONS", "OpenAIEmbeddingProviderOptions.modelId must be non-empty.");
   }
@@ -187,7 +183,9 @@ export function createOpenAIEmbeddingProvider(
   const fallbackBaseUrl =
     options.baseUrl ??
     options.model?.baseUrl ??
-    (options.authFrom ? options.authFrom.models.getProvider(options.authFrom.providerId)?.baseUrl : undefined);
+    (options.authFrom
+      ? options.authFrom.models.getProvider(options.authFrom.providerId)?.baseUrl
+      : undefined);
 
   if (!fallbackBaseUrl && !options.authFrom && !options.getAuth) {
     throw new HarnessError(
@@ -381,7 +379,9 @@ export function createOpenAIEmbeddingProvider(
         }
         const norm = Math.hypot(...nums);
         if (!norm || !Number.isFinite(norm)) {
-          throw new Error(`Embedding vector at index ${expectedIndex} has zero norm and cannot be normalized.`);
+          throw new Error(
+            `Embedding vector at index ${expectedIndex} has zero norm and cannot be normalized.`,
+          );
         }
         return nums.map((n) => n / norm);
       });

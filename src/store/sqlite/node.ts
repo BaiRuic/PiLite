@@ -3,10 +3,10 @@ import { dirname } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import {
   SerialOperationQueue,
-  validateSqliteSchemaPrefix,
   type SqliteDatabase,
   type SqliteExecutor,
   type SqliteValue,
+  validateSqliteSchemaPrefix,
 } from "./database.js";
 import { SqliteSessionStore, type SqliteSessionStoreOptions } from "./store.js";
 

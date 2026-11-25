@@ -95,26 +95,28 @@ describe("createOpenAIEmbeddingProvider (standalone)", () => {
       make(() => new Response(JSON.stringify({ data: [] }), { status: 200 })).embed(["a"]),
     ).rejects.toThrow(/returned 0 vectors/);
     await expect(
-      make(() =>
-        new Response(
-          JSON.stringify({
-            data: [
-              { index: 0, embedding: [1, 2] },
-              { index: 1, embedding: [1, 2, 3] },
-            ],
-          }),
-          { status: 200 },
-        ),
+      make(
+        () =>
+          new Response(
+            JSON.stringify({
+              data: [
+                { index: 0, embedding: [1, 2] },
+                { index: 1, embedding: [1, 2, 3] },
+              ],
+            }),
+            { status: 200 },
+          ),
       ).embed(["a", "b"]),
     ).rejects.toThrow(/Inconsistent embedding dimensions/);
     await expect(
-      make(() =>
-        new Response(JSON.stringify({ data: [{ index: 0, embedding: [0, 0] }] }), { status: 200 }),
+      make(
+        () => new Response(JSON.stringify({ data: [{ index: 0, embedding: [0, 0] }] }), { status: 200 }),
       ).embed(["a"]),
     ).rejects.toThrow(/zero norm/);
     await expect(
       make(
-        () => new Response(JSON.stringify({ data: [{ index: 0, embedding: [1, 2, 3, 4] }] }), { status: 200 }),
+        () =>
+          new Response(JSON.stringify({ data: [{ index: 0, embedding: [1, 2, 3, 4] }] }), { status: 200 }),
         { maxResponseBytes: 16 },
       ).embed(["a"]),
     ).rejects.toThrow(/exceeds limit/);
@@ -162,9 +164,7 @@ describe("ModelHub embedding model discovery, selection, and auth reuse", () => 
       providers: {
         ollama: {
           baseUrl: "http://127.0.0.1:11434/v1",
-          embeddingModels: [
-            { id: "nomic-embed-text", name: "Nomic Embed", dimensions: 768 },
-          ],
+          embeddingModels: [{ id: "nomic-embed-text", name: "Nomic Embed", dimensions: 768 }],
         },
         unconfigured: {
           embeddingModels: [{ id: "embed-disabled", dimensions: 1536 }],

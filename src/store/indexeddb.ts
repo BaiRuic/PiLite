@@ -1,11 +1,11 @@
 /// <reference lib="dom" />
 
 import {
-  summarizeSnapshot,
   type SessionListPage,
   type SessionListQuery,
   type SessionSnapshot,
   type SessionStore,
+  summarizeSnapshot,
 } from "../types.js";
 import { filterAndPaginateSummaries, validateSessionListQuery } from "./query.js";
 
@@ -77,7 +77,9 @@ function openDatabase(factory: IDBFactory, name: string, storeName: string): Pro
       }
     });
     request.addEventListener("blocked", () => {
-      reject(new IndexedDbFailure(`IndexedDB database "${name}" upgrade is blocked by another open connection`));
+      reject(
+        new IndexedDbFailure(`IndexedDB database "${name}" upgrade is blocked by another open connection`),
+      );
     });
     request.addEventListener("success", () => resolve(request.result), { once: true });
     request.addEventListener(

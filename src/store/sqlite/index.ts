@@ -1,14 +1,14 @@
 export {
   SerialOperationQueue,
-  validateSqliteSchemaPrefix,
   type SqliteDatabase,
   type SqliteExecutor,
   type SqliteValue,
+  validateSqliteSchemaPrefix,
 } from "./database.js";
 export {
   applySqliteMigrations,
-  createSqliteSessionSchema,
   CURRENT_SQLITE_SCHEMA_VERSION,
+  createSqliteSessionSchema,
   SQLITE_MIGRATIONS,
   type SqliteMigration,
   type SqliteSessionSchema,

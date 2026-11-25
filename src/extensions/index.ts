@@ -1,6 +1,5 @@
-export { ExtensionRunner, type ExtensionHostBindings } from "./runner.js";
+export { type ExtensionHostBindings, ExtensionRunner } from "./runner.js";
 export {
-  defineTool,
   type AfterProviderResponseEvent,
   type BeforeAgentStartEvent,
   type BeforeAgentStartResult,
@@ -8,6 +7,7 @@ export {
   type BeforeProviderRequestResult,
   type ContextExtensionEvent,
   type ContextExtensionResult,
+  defineTool,
   type ExecuteToolOptions,
   type ExtensionAPI,
   type ExtensionContext,

@@ -1,50 +1,50 @@
 import { randomUUID } from "node:crypto";
 import {
   Agent,
-  runToolCall,
   type AgentEvent,
   type AgentMessage,
   type AgentToolCall,
+  runToolCall,
   type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import {
-  contentText,
-  getCurrentSystemMessage,
-  isContextOverflow,
-  isRetryableAssistantError,
-  retryDelayMs,
   type Api,
   type AssistantMessage,
   type ClientIdentity,
+  contentText,
+  getCurrentSystemMessage,
   type ImageContent,
+  isContextOverflow,
+  isRetryableAssistantError,
   type JsonObject,
   type Model,
   type Models,
+  retryDelayMs,
   type SystemMessage,
   type TextContent,
 } from "@earendil-works/pi-ai";
 import {
+  type CompactionOptions,
+  type CompactionRequestOptions,
+  type CompactionResult,
   defaultSummarizeMessages,
   estimateTranscriptTokens,
   isSafeForkBoundary,
   planCompaction,
-  type CompactionOptions,
-  type CompactionRequestOptions,
-  type CompactionResult,
 } from "./compaction.js";
 import { ExtensionRunner } from "./extensions/runner.js";
 import { buildSystemPromptPatch, createInitialTranscript } from "./system-prompt.js";
 import {
-  HarnessError,
-  SESSION_SNAPSHOT_VERSION,
   type BaseSessionOptions,
   type CreateSessionOptions,
   type CustomSessionEntry,
   type ForkSessionOptions,
+  HarnessError,
   type ModelRef,
   type ModelsProvider,
   type OpenSessionOptions,
   type RetryOptions,
+  SESSION_SNAPSHOT_VERSION,
   type SessionEventListener,
   type SessionRunResult,
   type SessionSnapshot,
@@ -69,7 +69,10 @@ interface ActiveRun {
 function validateMaxTurns(maxTurns: number | undefined): void {
   if (maxTurns === undefined) return;
   if (!Number.isSafeInteger(maxTurns) || maxTurns < 1) {
-    throw new HarnessError("INVALID_OPTIONS", `maxTurns must be a positive safe integer, got: ${String(maxTurns)}`);
+    throw new HarnessError(
+      "INVALID_OPTIONS",
+      `maxTurns must be a positive safe integer, got: ${String(maxTurns)}`,
+    );
   }
 }
 
@@ -199,7 +202,10 @@ function stripTrailingFailedAssistants(messages: readonly AgentMessage[]): Agent
   return result;
 }
 
-function insertBeforeTrailingNonSystem(messages: readonly AgentMessage[], patch: AgentMessage): AgentMessage[] {
+function insertBeforeTrailingNonSystem(
+  messages: readonly AgentMessage[],
+  patch: AgentMessage,
+): AgentMessage[] {
   let insertIndex = messages.length;
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i]?.role !== "system") {
@@ -325,8 +331,7 @@ export class HarnessSession {
           details: result.details,
           isError,
         }),
-      onPayload: async (payload, reqModel) =>
-        this.extensions.emitBeforeProviderRequest(payload, reqModel),
+      onPayload: async (payload, reqModel) => this.extensions.emitBeforeProviderRequest(payload, reqModel),
       onResponse: async (response, reqModel) => {
         await this.extensions.emitAfterProviderResponse(response, reqModel);
       },
@@ -419,9 +424,10 @@ export class HarnessSession {
               type: "tool_call",
               toolCallId: tc.id,
               toolName: tc.name,
-              input: (validatedArgs && typeof validatedArgs === "object"
-                ? validatedArgs
-                : {}) as Record<string, unknown>,
+              input: (validatedArgs && typeof validatedArgs === "object" ? validatedArgs : {}) as Record<
+                string,
+                unknown
+              >,
               ...(parentToolCallId !== undefined ? { parentToolCallId } : {}),
             }),
           afterToolCall: async ({ toolCall: tc, args: validatedArgs, result, isError }) =>
@@ -429,9 +435,10 @@ export class HarnessSession {
               type: "tool_result",
               toolCallId: tc.id,
               toolName: tc.name,
-              input: (validatedArgs && typeof validatedArgs === "object"
-                ? validatedArgs
-                : {}) as Record<string, unknown>,
+              input: (validatedArgs && typeof validatedArgs === "object" ? validatedArgs : {}) as Record<
+                string,
+                unknown
+              >,
               content: result.content,
               details: result.details,
               isError,
@@ -837,9 +844,7 @@ export class HarnessSession {
     this.assertReadyForRun();
     this.agent.state.model = resolveModelOrThrow(this.getModels(), this.committedSnapshot.model);
     const keepRecentTokens =
-      options.keepRecentTokens ??
-      this.compaction?.keepRecentTokens ??
-      DEFAULT_COMPACTION_KEEP_RECENT_TOKENS;
+      options.keepRecentTokens ?? this.compaction?.keepRecentTokens ?? DEFAULT_COMPACTION_KEEP_RECENT_TOKENS;
 
     const outcome = await this.runCompactionOnMessages(
       this.agent.state.messages,
@@ -1137,7 +1142,12 @@ export class HarnessSession {
 
   private startRun(
     plan:
-      | { kind: "prompt"; promptText: string; pendingMessages: AgentMessage[]; preRunMessages: AgentMessage[] }
+      | {
+          kind: "prompt";
+          promptText: string;
+          pendingMessages: AgentMessage[];
+          preRunMessages: AgentMessage[];
+        }
       | { kind: "continue"; promptText: string; preRunMessages: AgentMessage[] },
   ): Promise<SessionRunResult> {
     const runHandle: ActiveRun = {
@@ -1169,7 +1179,12 @@ export class HarnessSession {
 
   private async executeRun(
     plan:
-      | { kind: "prompt"; promptText: string; pendingMessages: AgentMessage[]; preRunMessages: AgentMessage[] }
+      | {
+          kind: "prompt";
+          promptText: string;
+          pendingMessages: AgentMessage[];
+          preRunMessages: AgentMessage[];
+        }
       | { kind: "continue"; promptText: string; preRunMessages: AgentMessage[] },
     runHandle: ActiveRun,
   ): Promise<SessionRunResult> {
@@ -1183,7 +1198,10 @@ export class HarnessSession {
       const contextWindow = this.effectiveContextWindow();
       const reserveTokens = this.compaction.reserveTokens ?? DEFAULT_COMPACTION_RESERVE_TOKENS;
       const keepRecentTokens = this.compaction.keepRecentTokens ?? DEFAULT_COMPACTION_KEEP_RECENT_TOKENS;
-      if (contextWindow > 0 && estimateTranscriptTokens(activePlan.preRunMessages) > contextWindow - reserveTokens) {
+      if (
+        contextWindow > 0 &&
+        estimateTranscriptTokens(activePlan.preRunMessages) > contextWindow - reserveTokens
+      ) {
         const compacted = await this.runCompactionOnMessages(
           this.agent.state.messages,
           keepRecentTokens,
@@ -1324,10 +1342,7 @@ export class HarnessSession {
       // Transient provider error auto-retry.
       if (retryAttempt < maxRetries && isRetryableAssistantError(lastAssistant)) {
         retryAttempt += 1;
-        const delayMs = retryDelayMs(
-          { baseDelayMs, maxAgentDelayMs: maxDelayMs },
-          retryAttempt,
-        );
+        const delayMs = retryDelayMs({ baseDelayMs, maxAgentDelayMs: maxDelayMs }, retryAttempt);
         this.retry?.onRetry?.({
           attempt: retryAttempt,
           maxRetries,

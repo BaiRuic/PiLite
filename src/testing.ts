@@ -1,8 +1,8 @@
 export {
-  registerCredentialStoreContract,
-  registerModelsStoreContract,
   type CredentialStoreFactory,
   type ModelsStoreFactory,
+  registerCredentialStoreContract,
+  registerModelsStoreContract,
 } from "./models/contract.js";
 export {
   registerSessionStoreContract,

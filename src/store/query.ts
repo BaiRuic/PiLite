@@ -1,9 +1,9 @@
 import {
   HarnessError,
-  sortSessionSummaries,
   type SessionListPage,
   type SessionListQuery,
   type SessionSummary,
+  sortSessionSummaries,
 } from "../types.js";
 
 export interface DecodedSessionCursor {

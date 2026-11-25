@@ -68,6 +68,12 @@
     "build": "pnpm clean && tsc -p tsconfig.build.json",
     "build:bun-verify": "bun build --compile --no-compile-autoload-bunfig --no-compile-autoload-dotenv ./scripts/verify-bun-host.ts --outfile dist/verify-bun-host",
     "typecheck": "tsc --noEmit",
+    "lint": "biome lint",
+    "lint:fix": "biome lint --write",
+    "format": "biome format --write",
+    "format:check": "biome format",
+    "check": "biome check && pnpm typecheck",
+    "check:fix": "biome check --write && pnpm typecheck",
     "test": "pnpm build && vitest run",
     "test:bun": "bun test test/bun-sqlite.bun.test.ts",
     "test:watch": "vitest"
@@ -81,6 +87,7 @@
     "@earendil-works/pi-schema": "^1.6.0"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.6.8",
     "@types/node": "^22.19.19",
     "fake-indexeddb": "^6.2.8",
     "typescript": "^5.8.3",

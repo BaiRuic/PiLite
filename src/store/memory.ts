@@ -1,9 +1,9 @@
 import {
-  summarizeSnapshot,
   type SessionListPage,
   type SessionListQuery,
   type SessionSnapshot,
   type SessionStore,
+  summarizeSnapshot,
 } from "../types.js";
 import { filterAndPaginateSummaries } from "./query.js";
 

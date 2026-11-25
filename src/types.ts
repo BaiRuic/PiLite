@@ -7,13 +7,13 @@ import type {
   ToolExecutionMode,
 } from "@earendil-works/pi-agent-core";
 import type { ClientIdentity, Models, ThinkingBudgets } from "@earendil-works/pi-ai";
+import type { CompactionOptions } from "./compaction.js";
 import type {
   ExtensionDiagnostic,
   ExtensionExecFn,
   ExtensionRegistration,
   ExtensionUIAdapter,
 } from "./extensions/types.js";
-import type { CompactionOptions } from "./compaction.js";
 
 export const SESSION_SNAPSHOT_VERSION = 1 as const;
 
@@ -99,7 +99,8 @@ export function summarizeSnapshot(snapshot: SessionSnapshot): SessionSummary {
 /** Sort summaries newest-updated first, breaking ties deterministically by `sessionId`. */
 export function sortSessionSummaries(summaries: SessionSummary[]): SessionSummary[] {
   return summaries.sort(
-    (a, b) => b.updatedAt - a.updatedAt || (a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 : 0),
+    (a, b) =>
+      b.updatedAt - a.updatedAt || (a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 : 0),
   );
 }
 

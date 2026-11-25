@@ -9,36 +9,25 @@ import {
   FileCredentialStore,
   FileModelsStore,
 } from "../src/models/node/index.js";
-import {
-  registerCredentialStoreContract,
-  registerModelsStoreContract,
-} from "../src/testing.js";
+import { registerCredentialStoreContract, registerModelsStoreContract } from "../src/testing.js";
 
-registerCredentialStoreContract(
-  { describe, it, expect },
-  "FileCredentialStore (node:fs)",
-  async (use) => {
-    const dir = await mkdtemp(join(tmpdir(), "pi-harness-file-cred-"));
-    try {
-      await use(new FileCredentialStore(join(dir, "auth.json")));
-    } finally {
-      await rm(dir, { recursive: true, force: true });
-    }
-  },
-);
+registerCredentialStoreContract({ describe, it, expect }, "FileCredentialStore (node:fs)", async (use) => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-harness-file-cred-"));
+  try {
+    await use(new FileCredentialStore(join(dir, "auth.json")));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
-registerModelsStoreContract(
-  { describe, it, expect },
-  "FileModelsStore (node:fs)",
-  async (use) => {
-    const dir = await mkdtemp(join(tmpdir(), "pi-harness-file-models-"));
-    try {
-      await use(new FileModelsStore(join(dir, "models-store.json")));
-    } finally {
-      await rm(dir, { recursive: true, force: true });
-    }
-  },
-);
+registerModelsStoreContract({ describe, it, expect }, "FileModelsStore (node:fs)", async (use) => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-harness-file-models-"));
+  try {
+    await use(new FileModelsStore(join(dir, "models-store.json")));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 describe("createJsonFileModelSource (JSON/JSONC)", () => {
   it("loads JSONC with comments and BOM, and returns empty config on missing optional file", async () => {
@@ -109,10 +98,7 @@ describe("createCliAuthInteraction", () => {
       userCode: "ABCD-1234",
     });
 
-    expect(openedUrls).toEqual([
-      "https://auth.example.com/start",
-      "https://auth.example.com/device",
-    ]);
+    expect(openedUrls).toEqual(["https://auth.example.com/start", "https://auth.example.com/device"]);
     expect(written).toContain("https://auth.example.com/start");
     expect(written).toContain("ABCD-1234");
 

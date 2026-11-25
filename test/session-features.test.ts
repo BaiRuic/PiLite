@@ -1,18 +1,9 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { createModels } from "@earendil-works/pi-ai";
-import {
-  fauxAssistantMessage,
-  fauxProvider,
-  fauxToolCall,
-} from "@earendil-works/pi-ai/providers/faux";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { obj, str } from "@earendil-works/pi-schema";
 import { describe, expect, it } from "vitest";
-import {
-  HarnessError,
-  InMemorySessionStore,
-  createSession,
-  openSession,
-} from "../src/index.js";
+import { createSession, HarnessError, InMemorySessionStore, openSession } from "../src/index.js";
 
 function createTestEnv() {
   const faux = fauxProvider({
@@ -143,10 +134,7 @@ describe("HarnessSession management features (fork, setModel, thinking, title, r
 
     await session.prompt("turn 1");
 
-    await expectHarnessError(
-      session.setModel({ provider: "faux", modelId: "missing" }),
-      "MODEL_NOT_FOUND",
-    );
+    await expectHarnessError(session.setModel({ provider: "faux", modelId: "missing" }), "MODEL_NOT_FOUND");
 
     await session.setModel({ provider: "faux", modelId: "faux-2" });
     await session.setThinkingLevel("high");
@@ -169,10 +157,7 @@ describe("HarnessSession management features (fork, setModel, thinking, title, r
 
   it("resets history with optional handoff text while preserving model and system baseline", async () => {
     const { faux, models, store } = createTestEnv();
-    faux.setResponses([
-      fauxAssistantMessage("first reply"),
-      fauxAssistantMessage("reply after handoff"),
-    ]);
+    faux.setResponses([fauxAssistantMessage("first reply"), fauxAssistantMessage("reply after handoff")]);
 
     const session = await createSession({
       sessionId: "sess-reset",

@@ -12,7 +12,10 @@ import { openNodeSqliteSessionStore } from "../src/store/sqlite/node.js";
 const testDir = dirname(fileURLToPath(import.meta.url));
 const workerPath = join(testDir, "fixtures", "crash-worker.mjs");
 
-function runWorker(args: string[], options: { killOnMarker?: string } = {}): Promise<{ code: number | null; stdout: string; stderr: string }> {
+function runWorker(
+  args: string[],
+  options: { killOnMarker?: string } = {},
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [workerPath, ...args], {
       stdio: ["ignore", "pipe", "pipe"],

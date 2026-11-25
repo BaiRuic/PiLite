@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { HarnessError } from "../../types.js";
-import type { LocalModelsConfig, LocalModelSource } from "../local.js";
+import type { LocalModelSource, LocalModelsConfig } from "../local.js";
 
 export interface JsonFileModelSourceOptions {
   /** Label for diagnostics (defaults to the file path). */
@@ -77,11 +77,7 @@ function validateParsedConfig(parsed: unknown, filePath: string): LocalModelsCon
   if (record.providers === undefined) {
     return { providers: {} };
   }
-  if (
-    typeof record.providers !== "object" ||
-    record.providers === null ||
-    Array.isArray(record.providers)
-  ) {
+  if (typeof record.providers !== "object" || record.providers === null || Array.isArray(record.providers)) {
     throw new HarnessError(
       "INVALID_OPTIONS",
       `Local models config "${filePath}": "providers" must be an object keyed by provider ID.`,

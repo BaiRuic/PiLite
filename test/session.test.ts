@@ -9,11 +9,11 @@ import {
 import { obj, str } from "@earendil-works/pi-schema";
 import { describe, expect, it } from "vitest";
 import {
+  createSession,
   HarnessError,
   InMemorySessionStore,
-  SESSION_SNAPSHOT_VERSION,
-  createSession,
   openSession,
+  SESSION_SNAPSHOT_VERSION,
   type SessionSnapshot,
   type SessionStore,
 } from "../src/index.js";
@@ -108,10 +108,7 @@ describe("HarnessSession", () => {
         "SESSION_EXISTS",
       );
 
-      await expectHarnessError(
-        openSession({ sessionId: "missing", models, store }),
-        "SESSION_NOT_FOUND",
-      );
+      await expectHarnessError(openSession({ sessionId: "missing", models, store }), "SESSION_NOT_FOUND");
 
       await store.save("bad-version", {
         version: 999 as 1,
@@ -340,9 +337,9 @@ describe("HarnessSession", () => {
       expect(retried.status).toBe("idle");
       expect(retried.snapshot.messages.map((m) => m.role)).toEqual(["user", "assistant"]);
       const finalMsg = retried.snapshot.messages[1];
-      expect(finalMsg?.role === "assistant" && finalMsg.content[0]?.type === "text" && finalMsg.content[0].text).toBe(
-        "Full recovered answer",
-      );
+      expect(
+        finalMsg?.role === "assistant" && finalMsg.content[0]?.type === "text" && finalMsg.content[0].text,
+      ).toBe("Full recovered answer");
     });
 
     it("aborts cleanly during tool execution", async () => {

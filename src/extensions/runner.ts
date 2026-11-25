@@ -84,9 +84,7 @@ function createUIContext(adapter: ExtensionUIAdapter | undefined): {
   readonly hasUI: boolean;
   readonly ui: ExtensionUIContext;
 } {
-  const hasUI = Boolean(
-    adapter && (adapter.select || adapter.confirm || adapter.input || adapter.notify),
-  );
+  const hasUI = Boolean(adapter && (adapter.select || adapter.confirm || adapter.input || adapter.notify));
   return {
     hasUI,
     ui: {
@@ -177,7 +175,7 @@ export class ExtensionRunner {
 
     for (let index = 0; index < params.extensions.length; index += 1) {
       const entry = params.extensions[index]!;
-      const name = typeof entry === "function" ? (entry.name || `extension-${index + 1}`) : entry.name;
+      const name = typeof entry === "function" ? entry.name || `extension-${index + 1}` : entry.name;
       const factory = typeof entry === "function" ? entry : entry.factory;
       const api = runner.createAPI(name);
       await factory(api);
@@ -273,10 +271,9 @@ export class ExtensionRunner {
     let current = messages;
     for (const handler of [...list]) {
       try {
-        const result = (await handler.fn(
-          { type: "context", messages: current },
-          ctx,
-        )) as ContextExtensionResult | undefined;
+        const result = (await handler.fn({ type: "context", messages: current }, ctx)) as
+          | ContextExtensionResult
+          | undefined;
         if (result?.messages !== undefined) {
           current = result.messages;
         }
@@ -358,10 +355,9 @@ export class ExtensionRunner {
 
     for (const handler of [...list]) {
       try {
-        const result = (await handler.fn(
-          { ...event, content, details, isError },
-          ctx,
-        )) as ToolResultExtensionResult | undefined;
+        const result = (await handler.fn({ ...event, content, details, isError }, ctx)) as
+          | ToolResultExtensionResult
+          | undefined;
         if (!result) continue;
         if (result.content !== undefined) {
           content = result.content;

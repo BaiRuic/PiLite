@@ -1,10 +1,10 @@
 import {
-  summarizeSnapshot,
   type SessionListPage,
   type SessionListQuery,
   type SessionSnapshot,
   type SessionStore,
   type SessionSummary,
+  summarizeSnapshot,
 } from "../../types.js";
 import { filterAndPaginateSummaries, validateSessionListQuery } from "../query.js";
 import { SerialOperationQueue } from "../sqlite/database.js";
@@ -53,8 +53,9 @@ function encodeSessionFileName(sessionId: string): string {
     throw new Error("sessionId must be a non-empty string");
   }
   // Percent-encode anything outside `[A-Za-z0-9._-]` and avoid `.` / `..` segments.
-  const encoded = sessionId.replace(/[^A-Za-z0-9_-]/g, (char) =>
-    `%${char.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`,
+  const encoded = sessionId.replace(
+    /[^A-Za-z0-9_-]/g,
+    (char) => `%${char.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`,
   );
   return `${encoded}.jsonl`;
 }
@@ -169,11 +170,7 @@ export class JsonlSessionStore implements SessionStore {
   private directoryReady = false;
   private closed = false;
 
-  private constructor(
-    directory: string,
-    fs: JsonlFileSystem,
-    options: JsonlSessionStoreOptions,
-  ) {
+  private constructor(directory: string, fs: JsonlFileSystem, options: JsonlSessionStoreOptions) {
     const compactAfterLines = options.compactAfterLines ?? DEFAULT_COMPACT_AFTER_LINES;
     if (!Number.isSafeInteger(compactAfterLines) || compactAfterLines < 0) {
       throw new Error(`compactAfterLines must be a non-negative integer, got: ${String(compactAfterLines)}`);

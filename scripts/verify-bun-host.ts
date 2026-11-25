@@ -22,12 +22,7 @@ import {
 } from "@earendil-works/pi-ai/providers/faux";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { obj, str } from "@earendil-works/pi-schema";
-import {
-  SESSION_SNAPSHOT_VERSION,
-  createSession,
-  openSession,
-  type ModelRef,
-} from "../src/index.js";
+import { createSession, type ModelRef, openSession, SESSION_SNAPSHOT_VERSION } from "../src/index.js";
 import { openBunSqliteSessionStore } from "../src/store/sqlite/bun.js";
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -93,11 +88,7 @@ async function runOfflineVerification(dbPath: string): Promise<void> {
     // 2. Abort mid-stream
     let aborted = false;
     s1.subscribe((event) => {
-      if (
-        !aborted &&
-        event.type === "message_update" &&
-        event.assistantMessageEvent.type === "text_delta"
-      ) {
+      if (!aborted && event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
         aborted = true;
         void s1.abort();
       }
@@ -113,7 +104,11 @@ async function runOfflineVerification(dbPath: string): Promise<void> {
       status: "running",
       updatedAt: Date.now(),
       messages: [
-        { role: "user", content: [{ type: "text", text: "interrupted before reply" }], timestamp: Date.now() },
+        {
+          role: "user",
+          content: [{ type: "text", text: "interrupted before reply" }],
+          timestamp: Date.now(),
+        },
       ],
     });
   } finally {

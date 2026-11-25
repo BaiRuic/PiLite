@@ -1,9 +1,4 @@
-import type {
-  CredentialStore,
-  ModelsStore,
-  ModelsStoreEntry,
-  OAuthCredential,
-} from "@earendil-works/pi-ai";
+import type { CredentialStore, ModelsStore, ModelsStoreEntry, OAuthCredential } from "@earendil-works/pi-ai";
 import type { SessionStoreContractRunner } from "../store/contract.js";
 
 export type CredentialStoreFactory = (use: (store: CredentialStore) => Promise<void>) => Promise<void>;

@@ -1,18 +1,14 @@
 import { createModels, getCurrentSystemPrompt } from "@earendil-works/pi-ai";
-import {
-  fauxAssistantMessage,
-  fauxProvider,
-  fauxToolCall,
-} from "@earendil-works/pi-ai/providers/faux";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { obj, str } from "@earendil-works/pi-schema";
 import { describe, expect, it } from "vitest";
 import {
-  InMemorySessionStore,
   createSession,
   defineTool,
-  openSession,
   type ExtensionDiagnostic,
   type ExtensionFactory,
+  InMemorySessionStore,
+  openSession,
   type SessionStore,
 } from "../src/index.js";
 
@@ -112,6 +108,7 @@ describe("Headless Extension System", () => {
         if (event.toolName === "drop_db") {
           return { block: true, reason: "drop_db is forbidden", terminate: true };
         }
+        return undefined;
       });
 
       pi.on("tool_result", (event) => {
@@ -121,6 +118,7 @@ describe("Headless Extension System", () => {
             details: { redacted: true },
           };
         }
+        return undefined;
       });
     };
 
@@ -172,6 +170,7 @@ describe("Headless Extension System", () => {
         if (overrideNextRun) {
           return { systemPrompt: `${event.systemPrompt}\nEXTRA RULE` };
         }
+        return undefined;
       });
 
       pi.on("context", (event) => ({
@@ -247,10 +246,7 @@ describe("Headless Extension System", () => {
       });
     };
 
-    faux.setResponses([
-      fauxAssistantMessage("ok 1"),
-      fauxAssistantMessage("ok 2 (will fail final save)"),
-    ]);
+    faux.setResponses([fauxAssistantMessage("ok 1"), fauxAssistantMessage("ok 2 (will fail final save)")]);
 
     const s1 = await createSession({
       sessionId: "sess-entries",
@@ -262,10 +258,7 @@ describe("Headless Extension System", () => {
 
     expect(s1.getSnapshot().customEntries?.map((e) => e.customType)).toEqual(["audit.init"]);
     await s1.prompt("turn 1");
-    expect(s1.getSnapshot().customEntries?.map((e) => e.customType)).toEqual([
-      "audit.init",
-      "audit.turn",
-    ]);
+    expect(s1.getSnapshot().customEntries?.map((e) => e.customType)).toEqual(["audit.init", "audit.turn"]);
     await s1.close();
     await s1.close(); // idempotent
 
@@ -276,10 +269,7 @@ describe("Headless Extension System", () => {
       store: flakyStore,
       extensions: [stateExt],
     });
-    expect(s2.getSnapshot().customEntries?.map((e) => e.customType)).toEqual([
-      "audit.init",
-      "audit.turn",
-    ]);
+    expect(s2.getSnapshot().customEntries?.map((e) => e.customType)).toEqual(["audit.init", "audit.turn"]);
 
     // Fail the final commit (pre-run save succeeds, final save fails).
     let saves = 0;
@@ -303,10 +293,7 @@ describe("Headless Extension System", () => {
 
     await expect(s3.prompt("turn 2")).rejects.toThrow("final save boom");
     // The `audit.turn` appended during the failed run was rolled back to match disk.
-    expect(s3.getSnapshot().customEntries?.map((e) => e.customType)).toEqual([
-      "audit.init",
-      "audit.turn",
-    ]);
+    expect(s3.getSnapshot().customEntries?.map((e) => e.customType)).toEqual(["audit.init", "audit.turn"]);
     expect(lifecycle).toEqual(["start:create", "shutdown", "start:open", "start:open"]);
   });
 
@@ -376,7 +363,7 @@ describe("Headless Extension System", () => {
   });
 
   it("returns safe headless defaults when ui/exec adapters are omitted", async () => {
-    const { faux, models, store } = createTestEnv();
+    const { models, store } = createTestEnv();
     let sawHasUI = true;
     let confirmResult = true;
     let execRejected = false;

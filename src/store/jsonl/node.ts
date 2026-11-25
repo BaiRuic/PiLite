@@ -5,7 +5,12 @@ import type { JsonlFileSystem } from "./filesystem.js";
 import { JsonlSessionStore, type JsonlSessionStoreOptions } from "./store.js";
 
 function isEnoent(error: unknown): boolean {
-  return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === "ENOENT";
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: unknown }).code === "ENOENT"
+  );
 }
 
 /**
@@ -41,7 +46,11 @@ export class NodeJsonlFileSystem implements JsonlFileSystem {
     }
   }
 
-  async writeFileAtomic(path: string, content: string, options?: { readonly fsync?: boolean }): Promise<void> {
+  async writeFileAtomic(
+    path: string,
+    content: string,
+    options?: { readonly fsync?: boolean },
+  ): Promise<void> {
     await mkdir(dirname(path), { recursive: true });
     const tempPath = `${path}.tmp-${randomUUID()}`;
     const handle = await open(tempPath, "wx");
@@ -105,6 +114,6 @@ export async function openNodeJsonlSessionStore(
 export {
   JsonlCorruptionError,
   JsonlSessionStore,
-  JsonlStorageReadOnlyError,
   type JsonlSessionStoreOptions,
+  JsonlStorageReadOnlyError,
 } from "./store.js";

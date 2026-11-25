@@ -98,10 +98,9 @@ export interface ExtensionToolDefinition<
 }
 
 /** Typed identity helper for defining extension tools (mirrors `pi-coding-agent`'s `defineTool`). */
-export function defineTool<
-  TParameters extends Record<string, any> = Record<string, any>,
-  TDetails = unknown,
->(tool: ExtensionToolDefinition<TParameters, TDetails>): ExtensionToolDefinition<TParameters, TDetails> {
+export function defineTool<TParameters extends Record<string, any> = Record<string, any>, TDetails = unknown>(
+  tool: ExtensionToolDefinition<TParameters, TDetails>,
+): ExtensionToolDefinition<TParameters, TDetails> {
   return tool;
 }
 
@@ -236,7 +235,10 @@ export interface ExtensionDiagnostic {
 
 export interface ExtensionAPI {
   on<K extends ExtensionEventName>(event: K, handler: ExtensionEventHandler<K>): () => void;
-  on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<unknown> | unknown): () => void;
+  on(
+    event: string,
+    handler: (event: unknown, ctx: ExtensionContext) => Promise<unknown> | unknown,
+  ): () => void;
   registerTool<TParameters extends Record<string, any> = Record<string, any>, TDetails = unknown>(
     tool: ExtensionToolDefinition<TParameters, TDetails>,
   ): void;

@@ -1,16 +1,10 @@
+// @ts-expect-error -- `bun:test` is provided by the Bun runtime.
+import { describe, expect, it } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-// @ts-expect-error -- `bun:test` is provided by the Bun runtime.
-import { describe, expect, it } from "bun:test";
-import {
-  createSqliteCredentialStore,
-  createSqliteModelsStore,
-} from "../src/models/sqlite/index.js";
-import {
-  openBunSqliteDatabase,
-  openBunSqliteSessionStore,
-} from "../src/store/sqlite/bun.js";
+import { createSqliteCredentialStore, createSqliteModelsStore } from "../src/models/sqlite/index.js";
+import { openBunSqliteDatabase, openBunSqliteSessionStore } from "../src/store/sqlite/bun.js";
 import {
   registerCredentialStoreContract,
   registerModelsStoreContract,
