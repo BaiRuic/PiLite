@@ -8,6 +8,7 @@
 - **Terminal status & cancellation**: `pi-agent-core` encodes model errors and cancellation in the final `AssistantMessage.stopReason` (`"error" | "aborted"`) rather than rejecting `prompt()`. The harness derives `idle` / `aborted` / `error` from abort intent and `stopReason`, drops empty `aborted` trailing messages, and keeps non-empty partial `aborted`/`error` messages for host display (skipped on subsequent turns by `pi-ai`).
 - **Save-failure rollback**: If final `save()` fails, in-memory messages and `customEntries` roll back to the last committed snapshot and the handle is marked `SESSION_INVALIDATED` so memory and storage never diverge.
 - **Crash recovery**: Opening a session whose persisted status is `"running"` immediately transitions it to `"interrupted"`, preserving committed history without replaying unfinished model or tool calls. Hosts may then call `prompt()` or explicitly `continue()`.
+- **Deferred model resolution on open**: `openSession()` succeeds without mutating storage even if the stored `ModelRef` is no longer present in `Models` (`session.resolvedModel === undefined`), keeping history inspection, `getStats()`, `setTitle()`, `setModel()`, and `fork()` working while rejecting `prompt()` / `continue()` / `compact()` with `MODEL_NOT_FOUND` until a valid model is explicitly selected via `setModel()` (or restored in `Models`).
 
 ## System Prompt Ownership
 

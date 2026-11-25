@@ -11,6 +11,7 @@
       "test/**/*.ts",
       "test/**/*.mjs",
       "scripts/**/*.ts",
+      "scripts/**/*.mjs",
       "vitest.config.ts",
       "package.json",
       "tsconfig*.json",

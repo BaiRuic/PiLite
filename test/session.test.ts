@@ -56,8 +56,8 @@ async function expectHarnessError(
 
 describe("HarnessSession", () => {
   describe("creation, opening, and model resolution", () => {
-    it("throws MODEL_NOT_FOUND without fallback when model is unavailable on create or open", async () => {
-      const { models, store } = createTestEnv();
+    it("throws MODEL_NOT_FOUND on create when model is unavailable, while openSession defers model resolution until execution", async () => {
+      const { faux, models, store } = createTestEnv();
 
       await expectHarnessError(
         createSession({
@@ -72,15 +72,39 @@ describe("HarnessSession", () => {
         version: SESSION_SNAPSHOT_VERSION,
         sessionId: "s-missing-model",
         model: { provider: "unknown-provider", modelId: "m-1" },
-        messages: [],
+        title: "Archived chat",
+        messages: [
+          { role: "user", content: [{ type: "text", text: "historical question" }], timestamp: 900 },
+        ],
         status: "idle",
         updatedAt: 1000,
       });
 
-      await expectHarnessError(
-        openSession({ sessionId: "s-missing-model", models, store }),
-        "MODEL_NOT_FOUND",
-      );
+      // Opening succeeds without mutating the persisted snapshot or updatedAt timestamp.
+      const degraded = await openSession({ sessionId: "s-missing-model", models, store, now: () => 9999 });
+      expect(degraded.resolvedModel).toBeUndefined();
+      expect(degraded.model).toEqual({ provider: "unknown-provider", modelId: "m-1" });
+      expect((await store.load("s-missing-model"))?.updatedAt).toBe(1000);
+      expect(degraded.getSnapshot().messages).toHaveLength(1);
+      expect(degraded.getStats().userMessages).toBe(1);
+
+      // Metadata mutations and forking remain available without a resolved model.
+      await degraded.setTitle("Renamed archived chat");
+      expect(degraded.title).toBe("Renamed archived chat");
+      const forked = await degraded.fork({ sessionId: "s-missing-fork" });
+      expect(forked.resolvedModel).toBeUndefined();
+
+      // Execution paths fail fast with MODEL_NOT_FOUND until a valid model is selected explicitly.
+      await expectHarnessError(degraded.prompt("try again"), "MODEL_NOT_FOUND");
+      await expectHarnessError(degraded.continue(), "MODEL_NOT_FOUND");
+      await expectHarnessError(degraded.compact(), "MODEL_NOT_FOUND");
+
+      // Explicitly switching models via setModel() restores execution capability.
+      faux.setResponses([fauxAssistantMessage("back online")]);
+      await degraded.setModel({ provider: "faux", modelId: "faux-1" });
+      expect(degraded.resolvedModel?.id).toBe("faux-1");
+      const run = await degraded.prompt("hello again");
+      expect(run.status).toBe("idle");
     });
 
     it("rejects duplicate create, missing open, unsupported version, and invalid maxTurns", async () => {

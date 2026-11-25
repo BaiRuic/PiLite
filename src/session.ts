@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import {
   Agent,
   type AgentEvent,
@@ -118,6 +117,17 @@ function validateCompactionOptions(compaction: CompactionOptions | undefined): v
       `compaction.keepRecentTokens must be a non-negative integer, got: ${String(compaction.keepRecentTokens)}`,
     );
   }
+}
+
+function generateRandomId(): string {
+  const cryptoObj = globalThis.crypto;
+  if (cryptoObj && typeof cryptoObj.randomUUID === "function") {
+    return cryptoObj.randomUUID();
+  }
+  throw new HarnessError(
+    "INVALID_OPTIONS",
+    "Web Crypto API (globalThis.crypto.randomUUID) is unavailable in this runtime.",
+  );
 }
 
 function resolveModels(source: ModelsProvider): Models {
@@ -260,7 +270,7 @@ export class HarnessSession {
 
   private constructor(params: {
     snapshot: SessionSnapshot;
-    model: Model<Api>;
+    model: Model<Api> | undefined;
     thinkingLevel: ThinkingLevel;
     extensions: ExtensionRunner;
     options: BaseSessionOptions;
@@ -283,7 +293,8 @@ export class HarnessSession {
     this.agent = new Agent({
       initialState: {
         systemPrompt: "",
-        model,
+        // Keep `model` unset until execution/setModel resolves it (matches pi-coding-agent / pi-durable).
+        model: model as Model<Api>,
         thinkingLevel,
         tools: extensions.getActiveAgentTools(),
         messages: structuredClone(snapshot.messages),
@@ -353,7 +364,7 @@ export class HarnessSession {
 
     this.extensions.bind({
       sessionId: snapshot.sessionId,
-      getModel: () => this.agent.state.model,
+      getModel: () => this.resolvedModel,
       ui: options.ui,
       exec: options.exec,
       onDiagnostic: options.onExtensionDiagnostic,
@@ -368,7 +379,7 @@ export class HarnessSession {
       },
       appendCustomEntry: <T = unknown>(customType: string, data?: T): CustomSessionEntry<T> => {
         const entry: CustomSessionEntry<T> = {
-          id: randomUUID(),
+          id: generateRandomId(),
           customType,
           ...(data !== undefined ? { data: structuredClone(data) } : {}),
           timestamp: this.now(),
@@ -384,19 +395,19 @@ export class HarnessSession {
       executeTool: async (name, args, execOptions, parentToolCallId) => {
         const toolCall: AgentToolCall = {
           type: "toolCall",
-          id: randomUUID(),
+          id: generateRandomId(),
           name,
           arguments: args as JsonObject,
         };
-        const currentModel = this.agent.state.model;
+        const currentModel = this.resolvedModel;
         const assistantMessage =
           findLastAssistantMessage(this.agent.state.messages) ??
           ({
             role: "assistant",
             content: [toolCall],
-            api: currentModel.api,
-            provider: currentModel.provider,
-            model: currentModel.id,
+            api: currentModel?.api ?? "openai-completions",
+            provider: currentModel?.provider ?? this.committedSnapshot.model.provider,
+            model: currentModel?.id ?? this.committedSnapshot.model.modelId,
             usage: {
               input: 0,
               output: 0,
@@ -469,7 +480,7 @@ export class HarnessSession {
     validateCompactionOptions(options.compaction);
     const resolvedModel = resolveModelOrThrow(resolveModels(options.models), options.model);
     const now = options.now ?? (() => Date.now());
-    const sessionId = options.sessionId ?? options.generateId?.() ?? randomUUID();
+    const sessionId = options.sessionId ?? options.generateId?.() ?? generateRandomId();
 
     if (!sessionId.trim()) {
       throw new HarnessError("INVALID_OPTIONS", "sessionId must be a non-empty string.");
@@ -535,7 +546,7 @@ export class HarnessSession {
       );
     }
 
-    const resolvedModel = resolveModelOrThrow(resolveModels(options.models), loaded.model);
+    const resolvedModel = resolveModels(options.models).getModel(loaded.model.provider, loaded.model.modelId);
     const thinkingLevel = options.thinkingLevel ?? loaded.thinkingLevel ?? "off";
 
     const extensions = await ExtensionRunner.load({
@@ -587,6 +598,14 @@ export class HarnessSession {
       provider: this.committedSnapshot.model.provider,
       modelId: this.committedSnapshot.model.modelId,
     };
+  }
+
+  /** Resolved `pi-ai` model from the active `Models` registry, or `undefined` when unavailable. */
+  get resolvedModel(): Model<Api> | undefined {
+    return this.getModels().getModel(
+      this.committedSnapshot.model.provider,
+      this.committedSnapshot.model.modelId,
+    );
   }
 
   /** Current thinking level. */
@@ -782,7 +801,7 @@ export class HarnessSession {
       );
     }
 
-    const newSessionId = options.sessionId ?? options.generateId?.() ?? randomUUID();
+    const newSessionId = options.sessionId ?? options.generateId?.() ?? generateRandomId();
     if (!newSessionId.trim()) {
       throw new HarnessError("INVALID_OPTIONS", "sessionId must be a non-empty string.");
     }
@@ -791,7 +810,7 @@ export class HarnessSession {
       throw new HarnessError("SESSION_EXISTS", `Session "${newSessionId}" already exists.`);
     }
 
-    const resolvedModel = resolveModelOrThrow(this.getModels(), this.committedSnapshot.model);
+    const resolvedModel = this.resolvedModel;
     const forkedExtensions = await ExtensionRunner.load({
       extensions: this.baseOptions.extensions ?? [],
       baseTools: this.baseOptions.tools ?? [],
@@ -857,7 +876,7 @@ export class HarnessSession {
     }
 
     const entry: CustomSessionEntry = {
-      id: randomUUID(),
+      id: generateRandomId(),
       customType: "harness.compaction",
       data: {
         summary: outcome.result.summary,
@@ -1174,7 +1193,7 @@ export class HarnessSession {
   }
 
   private effectiveContextWindow(): number {
-    return this.compaction?.contextWindow ?? this.agent.state.model.contextWindow ?? 0;
+    return this.compaction?.contextWindow ?? this.agent.state.model?.contextWindow ?? 0;
   }
 
   private async executeRun(
@@ -1211,7 +1230,7 @@ export class HarnessSession {
         if (compacted.compacted) {
           this.agent.state.messages = structuredClone(compacted.nextMessages);
           this.customEntries.push({
-            id: randomUUID(),
+            id: generateRandomId(),
             customType: "harness.compaction",
             data: {
               trigger: "threshold",
@@ -1323,7 +1342,7 @@ export class HarnessSession {
         if (compacted.compacted && !runHandle.abortRequested) {
           this.agent.state.messages = structuredClone(compacted.nextMessages);
           this.customEntries.push({
-            id: randomUUID(),
+            id: generateRandomId(),
             customType: "harness.compaction",
             data: {
               trigger: "overflow",

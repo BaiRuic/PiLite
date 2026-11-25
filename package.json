@@ -73,8 +73,9 @@
     "lint:fix": "biome lint --write",
     "format": "biome format --write",
     "format:check": "biome format",
-    "check": "biome check && pnpm typecheck",
-    "check:fix": "biome check --write && pnpm typecheck",
+    "check:browser-smoke": "node scripts/check-browser-smoke.mjs",
+    "check": "biome check && pnpm typecheck && pnpm check:browser-smoke",
+    "check:fix": "biome check --write && pnpm typecheck && pnpm check:browser-smoke",
     "test": "pnpm build && vitest run",
     "test:bun": "bun test test/bun-sqlite.bun.test.ts",
     "test:watch": "vitest"
@@ -90,6 +91,7 @@
   "devDependencies": {
     "@biomejs/biome": "^2.6.8",
     "@types/node": "^22.19.19",
+    "esbuild": "^0.28.2",
     "fake-indexeddb": "^6.2.8",
     "typescript": "^5.8.3",
     "vitest": "^4.1.12"

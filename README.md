@@ -8,10 +8,10 @@ Designed for desktop apps, servers, CLIs, and edge hosts that need an embedded a
 
 - **Headless Session Engine**: Run-level atomic persistence with rollback on save failure, crash recovery marking unfinished runs as `interrupted` without auto-replaying side effects, `abort()` settling, and live-run `steer()` / `followUp()` queues.
 - **Long-Conversation & Session Operations**: Independent `fork()` (guarding `toolCall`/`toolResult` boundaries), idle-time `setModel()` / `setThinkingLevel()` / `setTitle()`, `reset(handoff?)`, `getStats()`, transient error auto-`retry`, and manual / threshold / overflow `compact()`.
-- **Portable Multi-Backend Storage**: `SessionStore` with `parentSessionId` / `status` filtering and keyset cursor pagination across Memory, SQLite (`node:sqlite` + `bun:sqlite`, zero native C++ addons), JSONL (with truncated tail recovery & compaction), and IndexedDB — all validated by one shared contract suite.
+- **Portable Multi-Backend Storage**: `SessionStore` with `parentSessionId` / `status` filtering and keyset cursor pagination across Memory, SQLite (`node:sqlite` + `bun:sqlite`, zero native C++ addons), JSONL (with truncated tail recovery & compaction), and split summary/snapshot IndexedDB — all validated by one shared contract suite.
 - **Unified Model Management (Optional `pilite/models`)**: Hot-swappable `Models | (() => Models)` injection; `ModelHub` composing built-in OAuth subscription flows (with a CLI interaction bridge), self-hosted JWT/API backends, abstract `LocalModelSource` configs (JSON/JSONC + overlays + `/models` discovery), SQLite/file credential & catalog stores, and a peer OpenAI-compatible `EmbeddingProvider`.
 - **Headless Extensions (`pilite/extensions`)**: Code-registered `ExtensionFactory` supporting dynamic tool activation, nested `ctx.executeTool()` (via `runToolCall()`), lifecycle & interception hooks, atomically persisted `appendEntry`, a shared event bus, and optional `ui` / `exec` adapters.
-- **Single-Binary Deployment Friendly**: Zero native C++ addons; verified end-to-end with `bun build --compile` in a clean `PATH` without Node.js.
+- **Browser & Single-Binary Ready**: Runtime-neutral core (`pilite`, `pilite/extensions`, `pilite/models`, `pilite/storage/indexeddb`) uses zero `node:*` imports (enforced by an esbuild browser smoke check), and Node/Bun adapters have zero native C++ addons (verified with `bun build --compile` in a clean `PATH` without Node.js).
 
 ## Comparison with `pi-durable` and `pi-coding-agent`
 
@@ -89,9 +89,10 @@ Source code is the single source of truth; the docs below focus strictly on arch
 ## Development & Verification
 
 ```bash
-pnpm check            # Biome format/lint check + strict TypeScript typecheck
-pnpm check:fix        # Auto-format/fix + typecheck
-pnpm test             # Build and run all Vitest suites
-pnpm test:bun         # Run Bun SQLite contract suites
-pnpm build:bun-verify # Compile standalone Bun verification binary (dist/verify-bun-host)
+pnpm check              # Biome check + strict TypeScript typecheck + esbuild browser smoke check
+pnpm check:fix          # Auto-format/fix + typecheck + browser smoke check
+pnpm check:browser-smoke # Verify portable entry points bundle cleanly for browsers with zero node:* imports
+pnpm test               # Build and run all Vitest suites
+pnpm test:bun           # Run Bun SQLite contract suites
+pnpm build:bun-verify   # Compile standalone Bun verification binary (dist/verify-bun-host)
 ```

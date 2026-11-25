@@ -60,7 +60,7 @@ type RegisteredHandler = {
 
 export interface ExtensionHostBindings {
   readonly sessionId: string;
-  getModel(): Model<Api>;
+  getModel(): Model<Api> | undefined;
   readonly ui?: ExtensionUIAdapter;
   readonly exec?: ExtensionExecFn;
   readonly onDiagnostic?: (diagnostic: ExtensionDiagnostic) => void;

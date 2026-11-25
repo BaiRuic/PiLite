@@ -59,7 +59,7 @@ export interface ExecuteToolOptions {
 
 export interface ExtensionContext {
   readonly sessionId: string;
-  readonly model: Model<Api>;
+  readonly model: Model<Api> | undefined;
   readonly hasUI: boolean;
   readonly ui: ExtensionUIContext;
   getSystemPrompt(): string;

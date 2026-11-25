@@ -23,6 +23,7 @@
 - **No built-in coding tools or `ExecutionEnv`**: Host tools inject whatever clients or resources they need directly.
 - **No multi-process concurrent writes to the same session**: A single session allows at most one active run at a time.
 
-## Standalone Binary Verification
+## Runtime Portability & Verification
 
-[scripts/verify-bun-host.ts](../scripts/verify-bun-host.ts) is a minimal host harness compiled via `pnpm build:bun-verify` (with `--no-compile-autoload-bunfig --no-compile-autoload-dotenv`) and executed under a clean `PATH` without Node.js to verify streaming, tool calls, mid-stream abort, crash recovery, and `bun:sqlite` persistence.
+- **Browser smoke check**: [scripts/check-browser-smoke.mjs](../scripts/check-browser-smoke.mjs) bundles all runtime-neutral public entry points ([scripts/browser-smoke-entry.ts](../scripts/browser-smoke-entry.ts)) via `esbuild` (`platform: "browser"`) and fails if any `node:*` built-in or Node/Bun-only adapter leaks into portable modules. Run via `pnpm check:browser-smoke` (included in `pnpm check`).
+- **Standalone binary verification**: [scripts/verify-bun-host.ts](../scripts/verify-bun-host.ts) is a minimal host harness compiled via `pnpm build:bun-verify` (with `--no-compile-autoload-bunfig --no-compile-autoload-dotenv`) and executed under a clean `PATH` without Node.js to verify streaming, tool calls, mid-stream abort, crash recovery, and `bun:sqlite` persistence.
