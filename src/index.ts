@@ -1,14 +1,18 @@
 export {
+  type CompactionCheckpoint,
   type CompactionOptions,
   type CompactionPlan,
   type CompactionRequestOptions,
   type CompactionResult,
   type CompactionSummarizer,
   type CompactionSummarizerInput,
+  type CompactionTrigger,
+  createCompactionSummaryMessage,
   estimateMessageTokens,
   estimateTranscriptTokens,
   isSafeForkBoundary,
   planCompaction,
+  projectContextMessages,
 } from "./compaction.js";
 export {
   type AfterProviderResponseEvent,

@@ -18,6 +18,30 @@ const DEFAULT_SUMMARIZATION_PROMPT = [
   "Do not invent details not present in the transcript.",
 ].join(" ");
 
+export type CompactionTrigger = "manual" | "threshold" | "overflow";
+
+/**
+ * Non-destructive compaction checkpoint stored alongside the full append-only transcript.
+ *
+ * Modeled after `pi-durable` (`CompactionEntry.head`) and `pi-coding-agent`
+ * (`CompactionEntry.firstKeptEntryId`): historical messages are preserved intact in
+ * `SessionSnapshot.messages`, while the model context is projected from the latest checkpoint.
+ */
+export interface CompactionCheckpoint {
+  readonly id: string;
+  /** Index in `SessionSnapshot.messages` of the first message kept verbatim for the model. */
+  readonly firstKeptIndex: number;
+  /** Index in `SessionSnapshot.messages` where compaction occurred (for UI divider placement). */
+  readonly compactedAtIndex: number;
+  readonly summary: string;
+  readonly trigger: CompactionTrigger;
+  readonly compactedMessages: number;
+  readonly keptMessages: number;
+  readonly tokensBefore: number;
+  readonly tokensAfter: number;
+  readonly timestamp: number;
+}
+
 export interface CompactionSummarizerInput {
   readonly messages: readonly AgentMessage[];
   readonly instructions?: string;
@@ -48,10 +72,48 @@ export interface CompactionRequestOptions {
 export interface CompactionResult {
   readonly compacted: boolean;
   readonly summary?: string;
+  readonly checkpoint?: CompactionCheckpoint;
   readonly compactedMessages: number;
   readonly keptMessages: number;
   readonly tokensBefore: number;
   readonly tokensAfter: number;
+}
+
+/** Format a compaction summary into the synthetic user message injected at the checkpoint head. */
+export function createCompactionSummaryMessage(summary: string, timestamp: number): AgentMessage {
+  return {
+    role: "user",
+    content: [{ type: "text", text: `<conversation_summary>\n${summary}\n</conversation_summary>` }],
+    timestamp,
+  };
+}
+
+/**
+ * Project the effective model context from a full append-only transcript and its
+ * non-destructive compaction checkpoints.
+ *
+ * When no checkpoints exist, returns a defensive copy of `messages`. Otherwise uses the
+ * newest checkpoint: `[systemBaselineBeforeKept?, summaryMessage, ...messages.slice(firstKeptIndex)]`.
+ */
+export function projectContextMessages(
+  messages: readonly AgentMessage[],
+  compactions?: readonly CompactionCheckpoint[],
+): AgentMessage[] {
+  if (!compactions || compactions.length === 0) {
+    return structuredClone([...messages]);
+  }
+
+  const latest = compactions[compactions.length - 1]!;
+  const firstKeptIndex = Math.max(0, Math.min(latest.firstKeptIndex, messages.length));
+  const systemBaseline = getCurrentSystemMessage(messages.slice(0, firstKeptIndex));
+  const summaryMessage = createCompactionSummaryMessage(latest.summary, latest.timestamp);
+  const tail = messages.slice(firstKeptIndex);
+
+  return [
+    ...(systemBaseline ? [structuredClone(systemBaseline)] : []),
+    summaryMessage,
+    ...structuredClone(tail),
+  ];
 }
 
 /** Rough character-based token estimate (chars / 4) for compaction sizing. */
@@ -95,25 +157,31 @@ export function estimateTranscriptTokens(messages: readonly AgentMessage[]): num
   return total;
 }
 
+interface IndexedMessage {
+  readonly message: AgentMessage;
+  /** Original index in full `SessionSnapshot.messages`, or `undefined` for a prior compaction summary. */
+  readonly fullIndex: number | undefined;
+}
+
 /**
  * Group non-system messages into atomic units so an assistant message containing
  * `toolCall` blocks is never separated from its following `toolResult` messages.
  */
-function groupAtomicMessages(messages: readonly AgentMessage[]): AgentMessage[][] {
-  const groups: AgentMessage[][] = [];
+function groupAtomicMessages(items: readonly IndexedMessage[]): IndexedMessage[][] {
+  const groups: IndexedMessage[][] = [];
   let index = 0;
-  while (index < messages.length) {
-    const current = messages[index]!;
-    if (current.role === "assistant") {
+  while (index < items.length) {
+    const current = items[index]!;
+    if (current.message.role === "assistant") {
       const toolCallIds = new Set(
-        current.content.flatMap((block) => (block.type === "toolCall" ? [block.id] : [])),
+        current.message.content.flatMap((block) => (block.type === "toolCall" ? [block.id] : [])),
       );
       if (toolCallIds.size > 0) {
-        const group: AgentMessage[] = [current];
+        const group: IndexedMessage[] = [current];
         index += 1;
-        while (index < messages.length) {
-          const next = messages[index]!;
-          if (next.role === "toolResult" && toolCallIds.has(next.toolCallId)) {
+        while (index < items.length) {
+          const next = items[index]!;
+          if (next.message.role === "toolResult" && toolCallIds.has(next.message.toolCallId)) {
             group.push(next);
             index += 1;
             continue;
@@ -134,30 +202,51 @@ export interface CompactionPlan {
   readonly systemBaseline: SystemMessage | undefined;
   readonly toSummarize: AgentMessage[];
   readonly kept: AgentMessage[];
+  /** Index in the full transcript of the first message kept verbatim. */
+  readonly firstKeptIndex: number;
+  /** Index in the full transcript where compaction was recorded (`messages.length`). */
+  readonly compactedAtIndex: number;
 }
 
 /**
- * Find a safe compaction cut point that keeps recent atomic message groups
- * within `keepRecentTokens` (always keeping at least the most recent group).
+ * Find a safe non-destructive compaction cut point over `messages` (respecting any prior
+ * `compactions` so subsequent compactions fold the previous summary forward) that keeps
+ * recent atomic message groups within `keepRecentTokens` without splitting tool pairs.
  */
 export function planCompaction(
   messages: readonly AgentMessage[],
   keepRecentTokens: number,
+  compactions?: readonly CompactionCheckpoint[],
 ): CompactionPlan | null {
-  const systemBaseline = getCurrentSystemMessage(messages);
-  const conversation = messages.filter((message) => message.role !== "system");
-  const groups = groupAtomicMessages(conversation);
+  const latest = compactions && compactions.length > 0 ? compactions[compactions.length - 1] : undefined;
+  const activeStart = latest ? Math.max(0, Math.min(latest.firstKeptIndex, messages.length)) : 0;
 
-  if (groups.length <= 1) {
+  const indexed: IndexedMessage[] = [];
+  if (latest) {
+    indexed.push({
+      message: createCompactionSummaryMessage(latest.summary, latest.timestamp),
+      fullIndex: undefined,
+    });
+  }
+  for (let i = activeStart; i < messages.length; i += 1) {
+    const message = messages[i]!;
+    if (message.role === "system") continue;
+    indexed.push({ message, fullIndex: i });
+  }
+
+  const groups = groupAtomicMessages(indexed);
+  // Require at least one real message beyond any prior summary plus one kept group.
+  const minSplitGroupIndex = latest ? 2 : 1;
+  if (groups.length <= minSplitGroupIndex) {
     return null;
   }
 
   let keptTokens = 0;
   let splitGroupIndex = groups.length;
 
-  for (let i = groups.length - 1; i >= 0; i--) {
+  for (let i = groups.length - 1; i >= 0; i -= 1) {
     const group = groups[i]!;
-    const groupTokens = estimateTranscriptTokens(group);
+    const groupTokens = estimateTranscriptTokens(group.map((item) => item.message));
     if (splitGroupIndex < groups.length && keptTokens + groupTokens > keepRecentTokens) {
       break;
     }
@@ -165,17 +254,24 @@ export function planCompaction(
     splitGroupIndex = i;
   }
 
-  if (splitGroupIndex <= 0) {
+  if (splitGroupIndex < minSplitGroupIndex) {
     return null;
   }
 
-  const toSummarize = groups.slice(0, splitGroupIndex).flat();
-  const kept = groups.slice(splitGroupIndex).flat();
-  if (toSummarize.length === 0) {
+  const toSummarizeItems = groups.slice(0, splitGroupIndex).flat();
+  const keptItems = groups.slice(splitGroupIndex).flat();
+  const firstKeptIndex = keptItems[0]?.fullIndex;
+  if (toSummarizeItems.length === 0 || firstKeptIndex === undefined) {
     return null;
   }
 
-  return { systemBaseline, toSummarize, kept };
+  return {
+    systemBaseline: getCurrentSystemMessage(messages.slice(0, firstKeptIndex)),
+    toSummarize: toSummarizeItems.map((item) => item.message),
+    kept: keptItems.map((item) => item.message),
+    firstKeptIndex,
+    compactedAtIndex: messages.length,
+  };
 }
 
 function renderMessagesForSummary(messages: readonly AgentMessage[]): string {
@@ -252,7 +348,7 @@ export function isSafeForkBoundary(messages: readonly AgentMessage[], cutIndex: 
     return true;
   }
   // Check whether any assistant message before `cutIndex` issued this toolCallId.
-  for (let i = cutIndex - 1; i >= 0; i--) {
+  for (let i = cutIndex - 1; i >= 0; i -= 1) {
     const candidate = messages[i];
     if (candidate?.role === "assistant") {
       const hasCall = candidate.content.some(

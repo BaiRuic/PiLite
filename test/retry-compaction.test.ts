@@ -147,20 +147,108 @@ describe("Auto-retry and context compaction", () => {
     await session.prompt(`Turn 2 question ${"b".repeat(200)}`);
     await session.prompt("Lookup recent");
 
+    const beforeMessageCount = session.getSnapshot().messages.length;
     const compacted = await session.compact({ keepRecentTokens: 60 });
     expect(compacted.compacted).toBe(true);
     expect(compacted.summary).toBe("Summary: discussed x and y.");
+    expect(compacted.checkpoint?.trigger).toBe("manual");
+    expect(compacted.checkpoint?.compactedAtIndex).toBe(beforeMessageCount);
     expect(compacted.compactedMessages).toBeGreaterThan(0);
     expect(compacted.tokensAfter).toBeLessThan(compacted.tokensBefore);
 
-    // Ensure toolCall and its toolResult stayed together or were compacted together (no orphan toolResult).
+    // Non-destructive: full transcript stays intact in snapshot.messages while projected
+    // model context starts with [system, <conversation_summary>, ...kept].
     const persisted = await openSession({ sessionId: "sess-compact-manual", models, store });
-    const roles = persisted.getSnapshot().messages.map((m) => m.role);
-    expect(roles[0]).toBe("system");
-    expect(roles[1]).toBe("user"); // <conversation_summary>
-    expect(persisted.getSnapshot().customEntries?.some((e) => e.customType === "harness.compaction")).toBe(
-      true,
+    expect(persisted.getSnapshot().messages).toHaveLength(beforeMessageCount);
+    expect(persisted.getSnapshot().compactions).toHaveLength(1);
+    expect(persisted.getSnapshot().compactions?.[0]?.summary).toBe("Summary: discussed x and y.");
+
+    const contextMessages = persisted.getContextMessages();
+    expect(contextMessages.length).toBeLessThan(beforeMessageCount);
+    const contextRoles = contextMessages.map((m) => m.role);
+    expect(contextRoles[0]).toBe("system");
+    expect(contextRoles[1]).toBe("user"); // <conversation_summary>
+    expect(persisted.getStats().userMessages).toBe(3);
+  });
+
+  it("supports repeated non-destructive compactions, fork across checkpoints, and reset", async () => {
+    const { faux, models, store } = createTestEnv();
+    const summarizerInputs: number[] = [];
+
+    faux.setResponses([
+      fauxAssistantMessage(`Turn 1 reply ${"a".repeat(240)}`),
+      fauxAssistantMessage(`Turn 2 reply ${"b".repeat(240)}`),
+      fauxAssistantMessage(`Turn 3 reply ${"c".repeat(240)}`),
+      fauxAssistantMessage(`Turn 4 reply ${"d".repeat(240)}`),
+      fauxAssistantMessage("Turn 5 reply after two compactions"),
+    ]);
+
+    const session = await createSession({
+      sessionId: "sess-multi-compact",
+      models,
+      store,
+      model: { provider: "faux", modelId: "faux-1" },
+      systemPrompt: "Base system.",
+      compaction: {
+        summarizer: async ({ messages }) => {
+          summarizerInputs.push(messages.length);
+          const first = messages[0];
+          const includesPreviousSummary =
+            first?.role === "user" &&
+            typeof first.content !== "string" &&
+            first.content.some((b) => b.type === "text" && b.text.includes("<conversation_summary>"));
+          return includesPreviousSummary ? "Folded summary #2" : "Initial summary #1";
+        },
+      },
+    });
+
+    await session.prompt(`Q1 ${"1".repeat(120)}`);
+    await session.prompt(`Q2 ${"2".repeat(120)}`);
+    const c1 = await session.compact({ keepRecentTokens: 40 });
+    expect(c1.compacted).toBe(true);
+    expect(c1.summary).toBe("Initial summary #1");
+    expect(session.getSnapshot().messages).toHaveLength(5); // system + 2*(user+assistant)
+
+    await session.prompt(`Q3 ${"3".repeat(120)}`);
+    await session.prompt(`Q4 ${"4".repeat(120)}`);
+    const c2 = await session.compact({ keepRecentTokens: 40 });
+    expect(c2.compacted).toBe(true);
+    expect(c2.summary).toBe("Folded summary #2");
+    expect(summarizerInputs).toHaveLength(2);
+
+    // Turn 5 runs against projected context while appending to full history.
+    const r5 = await session.prompt("Q5");
+    expect(r5.status).toBe("idle");
+    expect(r5.snapshot.messages).toHaveLength(11); // system + 5*(user+assistant)
+    expect(r5.snapshot.compactions).toHaveLength(2);
+    expect(r5.snapshot.compactions?.[0]?.firstKeptIndex).toBeLessThan(
+      r5.snapshot.compactions?.[1]?.firstKeptIndex ?? 0,
     );
+
+    const ctx = session.getContextMessages();
+    expect(ctx.length).toBeLessThan(11);
+    expect(ctx[0]?.role).toBe("system");
+    expect(ctx[1]?.role).toBe("user");
+    expect(JSON.stringify(ctx[1])).toContain("Folded summary #2");
+
+    // Fork BEFORE first compaction drops both checkpoints and exposes raw pre-compaction history.
+    const earlyFork = await session.fork({ sessionId: "fork-before-c1", atMessageIndex: 3 });
+    expect(earlyFork.getSnapshot().messages).toHaveLength(3);
+    expect(earlyFork.getSnapshot().compactions).toBeUndefined();
+    expect(earlyFork.getContextMessages()).toHaveLength(3);
+
+    // Fork BETWEEN compaction #1 and #2 keeps only checkpoint #1.
+    const midFork = await session.fork({
+      sessionId: "fork-between-c1-c2",
+      atMessageIndex: c1.checkpoint!.compactedAtIndex,
+    });
+    expect(midFork.getSnapshot().compactions).toHaveLength(1);
+    expect(JSON.stringify(midFork.getContextMessages()[1])).toContain("Initial summary #1");
+
+    // Reset clears both messages and checkpoints.
+    const resetSnap = await session.reset("Fresh handoff");
+    expect(resetSnap.compactions).toBeUndefined();
+    expect(session.getContextMessages()).toHaveLength(2); // system + handoff user
   });
 
   it("supports automatic threshold compaction and overflow recovery", async () => {
@@ -197,7 +285,9 @@ describe("Auto-retry and context compaction", () => {
 
     expect(r3.status).toBe("idle");
     expect(summariesMade.length).toBeGreaterThan(0);
-    expect(r3.snapshot.customEntries?.some((e) => e.customType === "harness.compaction")).toBe(true);
+    expect(r3.snapshot.messages).toHaveLength(6); // full 3*(user+assistant) preserved
+    expect(r3.snapshot.compactions?.some((c) => c.trigger === "threshold")).toBe(true);
+    expect(s1.getContextMessages().length).toBeLessThan(r3.snapshot.messages.length);
 
     // 2. Context overflow recovery: provider returns prompt-too-long error -> compacts once and retries.
     const overflowSummaries: number[] = [];
@@ -232,11 +322,8 @@ describe("Auto-retry and context compaction", () => {
 
     expect(recovered.status).toBe("idle");
     expect(overflowSummaries).toEqual([2]);
-    expect(
-      recovered.snapshot.customEntries?.some(
-        (e) =>
-          e.customType === "harness.compaction" && (e.data as { trigger?: string })?.trigger === "overflow",
-      ),
-    ).toBe(true);
+    expect(recovered.snapshot.messages).toHaveLength(4); // all 4 messages preserved intact
+    expect(recovered.snapshot.compactions?.some((c) => c.trigger === "overflow")).toBe(true);
+    expect(s2.getContextMessages()).toHaveLength(3); // summary + user("Trigger overflow") + recovered assistant
   });
 });

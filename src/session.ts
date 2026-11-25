@@ -23,13 +23,16 @@ import {
   type TextContent,
 } from "@earendil-works/pi-ai";
 import {
+  type CompactionCheckpoint,
   type CompactionOptions,
   type CompactionRequestOptions,
   type CompactionResult,
+  type CompactionTrigger,
   defaultSummarizeMessages,
   estimateTranscriptTokens,
   isSafeForkBoundary,
   planCompaction,
+  projectContextMessages,
 } from "./compaction.js";
 import { ExtensionRunner } from "./extensions/runner.js";
 import { buildSystemPromptPatch, createInitialTranscript } from "./system-prompt.js";
@@ -260,6 +263,7 @@ export class HarnessSession {
   private readonly listeners = new Set<SessionEventListener>();
 
   private committedSnapshot: SessionSnapshot;
+  private compactionCheckpoints: CompactionCheckpoint[];
   private customEntries: CustomSessionEntry[];
   private activeRun: ActiveRun | undefined;
   private activeRunSystemPromptOverride: string | undefined;
@@ -288,6 +292,7 @@ export class HarnessSession {
     this.identity = options.identity ?? DEFAULT_HARNESS_IDENTITY;
     this.desiredSystemPrompt = options.systemPrompt;
     this.committedSnapshot = structuredClone(snapshot);
+    this.compactionCheckpoints = structuredClone(snapshot.compactions ?? []);
     this.customEntries = structuredClone(snapshot.customEntries ?? []);
 
     this.agent = new Agent({
@@ -297,7 +302,7 @@ export class HarnessSession {
         model: model as Model<Api>,
         thinkingLevel,
         tools: extensions.getActiveAgentTools(),
-        messages: structuredClone(snapshot.messages),
+        messages: projectContextMessages(snapshot.messages, this.compactionCheckpoints),
       },
       streamFn: (reqModel, context, streamOptions) => {
         const currentModels = this.getModels();
@@ -565,6 +570,9 @@ export class HarnessSession {
         ...(loaded.title !== undefined ? { title: loaded.title } : {}),
         ...(loaded.parentSessionId !== undefined ? { parentSessionId: loaded.parentSessionId } : {}),
         messages: structuredClone(loaded.messages),
+        ...(loaded.compactions && loaded.compactions.length > 0
+          ? { compactions: structuredClone(loaded.compactions) }
+          : {}),
         ...(loaded.customEntries && loaded.customEntries.length > 0
           ? { customEntries: structuredClone(loaded.customEntries) }
           : {}),
@@ -587,9 +595,17 @@ export class HarnessSession {
     return session;
   }
 
-  /** Latest committed snapshot (defensive copy). */
+  /** Latest committed snapshot (defensive copy, including full append-only message history). */
   getSnapshot(): SessionSnapshot {
     return structuredClone(this.committedSnapshot);
+  }
+
+  /**
+   * Projected model context derived from the committed transcript and latest compaction
+   * checkpoint (defensive copy). Identical to `getSnapshot().messages` when uncompacted.
+   */
+  getContextMessages(): AgentMessage[] {
+    return projectContextMessages(this.committedSnapshot.messages, this.compactionCheckpoints);
   }
 
   /** Current persisted model reference. */
@@ -770,10 +786,12 @@ export class HarnessSession {
 
     const updated = this.buildSnapshot({
       messages: nextMessages,
+      compactions: [],
       status: "idle",
       lastError: undefined,
     });
     await this.store.save(this.sessionId, updated);
+    this.compactionCheckpoints = [];
     this.agent.state.messages = structuredClone(nextMessages);
     this.committedSnapshot = structuredClone(updated);
     return this.getSnapshot();
@@ -820,6 +838,9 @@ export class HarnessSession {
 
     const timestamp = this.now();
     const title = options.title !== undefined ? options.title : this.committedSnapshot.title;
+    const forkedCompactions = this.compactionCheckpoints.filter(
+      (checkpoint) => checkpoint.compactedAtIndex <= cutIndex,
+    );
     const forkedSnapshot: SessionSnapshot = {
       version: SESSION_SNAPSHOT_VERSION,
       sessionId: newSessionId,
@@ -831,6 +852,7 @@ export class HarnessSession {
       ...(title !== undefined ? { title } : {}),
       parentSessionId: this.sessionId,
       messages: structuredClone(currentMessages.slice(0, cutIndex)),
+      ...(forkedCompactions.length > 0 ? { compactions: structuredClone(forkedCompactions) } : {}),
       ...(this.customEntries.length > 0 ? { customEntries: structuredClone(this.customEntries) } : {}),
       status: "idle",
       createdAt: timestamp,
@@ -856,8 +878,8 @@ export class HarnessSession {
   }
 
   /**
-   * Manually compact older conversation messages into a summary while preserving
-   * recent turns and never splitting tool-call / tool-result pairs.
+   * Manually record a non-destructive compaction checkpoint over older messages while
+   * preserving full transcript history and never splitting tool-call / tool-result pairs.
    */
   async compact(options: CompactionRequestOptions = {}): Promise<CompactionResult> {
     this.assertReadyForRun();
@@ -865,39 +887,28 @@ export class HarnessSession {
     const keepRecentTokens =
       options.keepRecentTokens ?? this.compaction?.keepRecentTokens ?? DEFAULT_COMPACTION_KEEP_RECENT_TOKENS;
 
-    const outcome = await this.runCompactionOnMessages(
-      this.agent.state.messages,
+    const outcome = await this.runCompactionCheckpoint({
+      fullMessages: this.committedSnapshot.messages,
+      compactions: this.compactionCheckpoints,
       keepRecentTokens,
-      options.instructions,
-      undefined,
-    );
+      trigger: "manual",
+      instructions: options.instructions,
+    });
     if (!outcome.compacted) {
       return outcome.result;
     }
 
-    const entry: CustomSessionEntry = {
-      id: generateRandomId(),
-      customType: "harness.compaction",
-      data: {
-        summary: outcome.result.summary,
-        compactedMessages: outcome.result.compactedMessages,
-        keptMessages: outcome.result.keptMessages,
-        tokensBefore: outcome.result.tokensBefore,
-        tokensAfter: outcome.result.tokensAfter,
-      },
-      timestamp: this.now(),
-    };
-    const nextCustomEntries = [...structuredClone(this.customEntries), entry];
+    const nextCompactions = [...structuredClone(this.compactionCheckpoints), outcome.checkpoint];
     const updated = this.buildSnapshot({
-      messages: outcome.nextMessages,
-      customEntries: nextCustomEntries,
+      messages: this.committedSnapshot.messages,
+      compactions: nextCompactions,
       status: this.committedSnapshot.status,
       lastError: this.committedSnapshot.lastError,
     });
 
     await this.store.save(this.sessionId, updated);
-    this.agent.state.messages = structuredClone(outcome.nextMessages);
-    this.customEntries = nextCustomEntries;
+    this.compactionCheckpoints = nextCompactions;
+    this.agent.state.messages = structuredClone(outcome.nextContextMessages);
     this.committedSnapshot = structuredClone(updated);
     return outcome.result;
   }
@@ -981,7 +992,14 @@ export class HarnessSession {
       kind: "prompt",
       promptText: extractPromptText(userMessages),
       pendingMessages,
-      preRunMessages: [...structuredClone(this.agent.state.messages), ...structuredClone(pendingMessages)],
+      preRunFullMessages: [
+        ...structuredClone(this.committedSnapshot.messages),
+        ...structuredClone(pendingMessages),
+      ],
+      preRunContextMessages: [
+        ...structuredClone(this.agent.state.messages),
+        ...structuredClone(pendingMessages),
+      ],
     });
   }
 
@@ -992,24 +1010,34 @@ export class HarnessSession {
   async continue(): Promise<SessionRunResult> {
     this.assertReadyForRun();
 
-    const candidateMessages = stripTrailingFailedAssistants(this.agent.state.messages);
-    const lastMessage = candidateMessages[candidateMessages.length - 1];
-    if (!lastMessage || candidateMessages.every((message) => message.role === "system")) {
+    const candidateFullMessages = stripTrailingFailedAssistants(this.committedSnapshot.messages);
+    const clampedCompactions = this.compactionCheckpoints
+      .filter((checkpoint) => checkpoint.firstKeptIndex < candidateFullMessages.length)
+      .map((checkpoint) => ({
+        ...checkpoint,
+        compactedAtIndex: Math.min(checkpoint.compactedAtIndex, candidateFullMessages.length),
+      }));
+    const candidateContextMessages = projectContextMessages(candidateFullMessages, clampedCompactions);
+    const lastMessage = candidateContextMessages[candidateContextMessages.length - 1];
+    if (!lastMessage || candidateContextMessages.every((message) => message.role === "system")) {
       throw new HarnessError("NOTHING_TO_CONTINUE", "No user or toolResult message to continue from.");
     }
     if (lastMessage.role === "assistant") {
       throw new HarnessError("NOTHING_TO_CONTINUE", "Cannot continue from a completed assistant message.");
     }
 
-    const systemPatch = buildSystemPromptPatch(candidateMessages, this.desiredSystemPrompt, this.now);
-    const preRunMessages = systemPatch
-      ? insertBeforeTrailingNonSystem(candidateMessages, systemPatch)
-      : candidateMessages;
+    const systemPatch = buildSystemPromptPatch(candidateContextMessages, this.desiredSystemPrompt, this.now);
+    const preRunFullMessages = systemPatch
+      ? insertBeforeTrailingNonSystem(candidateFullMessages, systemPatch)
+      : candidateFullMessages;
+    const preRunContextMessages = projectContextMessages(preRunFullMessages, clampedCompactions);
 
     return this.startRun({
       kind: "continue",
-      promptText: extractPromptText(candidateMessages.slice(-1)),
-      preRunMessages: structuredClone(preRunMessages),
+      promptText: extractPromptText(candidateContextMessages.slice(-1)),
+      preRunFullMessages: structuredClone(preRunFullMessages),
+      preRunContextMessages: structuredClone(preRunContextMessages),
+      compactions: clampedCompactions,
     });
   }
 
@@ -1018,6 +1046,7 @@ export class HarnessSession {
     thinkingLevel?: ThinkingLevel;
     title?: string | undefined;
     messages: AgentMessage[];
+    compactions?: CompactionCheckpoint[];
     customEntries?: CustomSessionEntry[];
     status: SessionSnapshot["status"];
     lastError?: string | undefined;
@@ -1025,6 +1054,7 @@ export class HarnessSession {
     const model = overrides.model ?? this.committedSnapshot.model;
     const thinkingLevel = overrides.thinkingLevel ?? this.agent.state.thinkingLevel;
     const title = "title" in overrides ? overrides.title : this.committedSnapshot.title;
+    const compactions = overrides.compactions ?? this.compactionCheckpoints;
     const customEntries = overrides.customEntries ?? this.customEntries;
     const lastError = overrides.lastError;
     const createdAt = this.committedSnapshot.createdAt ?? this.committedSnapshot.updatedAt;
@@ -1039,6 +1069,7 @@ export class HarnessSession {
         ? { parentSessionId: this.committedSnapshot.parentSessionId }
         : {}),
       messages: structuredClone(overrides.messages),
+      ...(compactions.length > 0 ? { compactions: structuredClone(compactions) } : {}),
       ...(customEntries.length > 0 ? { customEntries: structuredClone(customEntries) } : {}),
       status: overrides.status,
       ...(lastError !== undefined ? { lastError } : {}),
@@ -1047,24 +1078,32 @@ export class HarnessSession {
     };
   }
 
-  private async runCompactionOnMessages(
-    messages: readonly AgentMessage[],
-    keepRecentTokens: number,
-    instructions: string | undefined,
-    signal: AbortSignal | undefined,
-  ): Promise<
+  private async runCompactionCheckpoint(params: {
+    readonly fullMessages: readonly AgentMessage[];
+    readonly compactions: readonly CompactionCheckpoint[];
+    readonly keepRecentTokens: number;
+    readonly trigger: CompactionTrigger;
+    readonly instructions: string | undefined;
+    readonly signal?: AbortSignal;
+  }): Promise<
     | { readonly compacted: false; readonly result: CompactionResult }
-    | { readonly compacted: true; readonly nextMessages: AgentMessage[]; readonly result: CompactionResult }
+    | {
+        readonly compacted: true;
+        readonly checkpoint: CompactionCheckpoint;
+        readonly nextContextMessages: AgentMessage[];
+        readonly result: CompactionResult;
+      }
   > {
-    const tokensBefore = estimateTranscriptTokens(messages);
-    const plan = planCompaction(messages, keepRecentTokens);
+    const currentContext = projectContextMessages(params.fullMessages, params.compactions);
+    const tokensBefore = estimateTranscriptTokens(currentContext);
+    const plan = planCompaction(params.fullMessages, params.keepRecentTokens, params.compactions);
     if (!plan) {
       return {
         compacted: false,
         result: {
           compacted: false,
           compactedMessages: 0,
-          keptMessages: messages.filter((m) => m.role !== "system").length,
+          keptMessages: currentContext.filter((m) => m.role !== "system").length,
           tokensBefore,
           tokensAfter: tokensBefore,
         },
@@ -1074,38 +1113,47 @@ export class HarnessSession {
     const summary = this.compaction?.summarizer
       ? await this.compaction.summarizer({
           messages: structuredClone(plan.toSummarize),
-          instructions,
+          instructions: params.instructions,
           model: this.agent.state.model,
-          signal,
+          signal: params.signal,
         })
       : await defaultSummarizeMessages({
           models: this.getModels(),
           model: this.agent.state.model,
           messages: plan.toSummarize,
-          instructions,
+          instructions: params.instructions,
           identity: this.identity,
-          signal,
+          signal: params.signal,
         });
 
-    const summaryMessage: AgentMessage = {
-      role: "user",
-      content: [{ type: "text", text: `<conversation_summary>\n${summary}\n</conversation_summary>` }],
-      timestamp: this.now(),
+    const timestamp = this.now();
+    const draftCheckpoint: CompactionCheckpoint = {
+      id: generateRandomId(),
+      firstKeptIndex: plan.firstKeptIndex,
+      compactedAtIndex: plan.compactedAtIndex,
+      summary,
+      trigger: params.trigger,
+      compactedMessages: plan.toSummarize.length,
+      keptMessages: plan.kept.length,
+      tokensBefore,
+      tokensAfter: 0,
+      timestamp,
     };
-
-    const nextMessages: AgentMessage[] = [
-      ...(plan.systemBaseline ? [structuredClone(plan.systemBaseline)] : []),
-      summaryMessage,
-      ...structuredClone(plan.kept),
-    ];
-    const tokensAfter = estimateTranscriptTokens(nextMessages);
+    const nextContextMessages = projectContextMessages(params.fullMessages, [
+      ...params.compactions,
+      draftCheckpoint,
+    ]);
+    const tokensAfter = estimateTranscriptTokens(nextContextMessages);
+    const checkpoint: CompactionCheckpoint = { ...draftCheckpoint, tokensAfter };
 
     return {
       compacted: true,
-      nextMessages,
+      checkpoint,
+      nextContextMessages,
       result: {
         compacted: true,
         summary,
+        checkpoint: structuredClone(checkpoint),
         compactedMessages: plan.toSummarize.length,
         keptMessages: plan.kept.length,
         tokensBefore,
@@ -1165,9 +1213,16 @@ export class HarnessSession {
           kind: "prompt";
           promptText: string;
           pendingMessages: AgentMessage[];
-          preRunMessages: AgentMessage[];
+          preRunFullMessages: AgentMessage[];
+          preRunContextMessages: AgentMessage[];
         }
-      | { kind: "continue"; promptText: string; preRunMessages: AgentMessage[] },
+      | {
+          kind: "continue";
+          promptText: string;
+          preRunFullMessages: AgentMessage[];
+          preRunContextMessages: AgentMessage[];
+          compactions: CompactionCheckpoint[];
+        },
   ): Promise<SessionRunResult> {
     const runHandle: ActiveRun = {
       promise: Promise.resolve() as unknown as Promise<SessionRunResult>,
@@ -1202,14 +1257,26 @@ export class HarnessSession {
           kind: "prompt";
           promptText: string;
           pendingMessages: AgentMessage[];
-          preRunMessages: AgentMessage[];
+          preRunFullMessages: AgentMessage[];
+          preRunContextMessages: AgentMessage[];
         }
-      | { kind: "continue"; promptText: string; preRunMessages: AgentMessage[] },
+      | {
+          kind: "continue";
+          promptText: string;
+          preRunFullMessages: AgentMessage[];
+          preRunContextMessages: AgentMessage[];
+          compactions: CompactionCheckpoint[];
+        },
     runHandle: ActiveRun,
   ): Promise<SessionRunResult> {
     this.agent.state.model = resolveModelOrThrow(this.getModels(), this.committedSnapshot.model);
     const beforeCustomEntries = structuredClone(this.customEntries);
-    const beforeMessages = structuredClone(this.agent.state.messages);
+    const beforeCompactions = structuredClone(this.compactionCheckpoints);
+    const beforeAgentMessages = structuredClone(this.agent.state.messages);
+
+    if (plan.kind === "continue") {
+      this.compactionCheckpoints = structuredClone(plan.compactions);
+    }
 
     // Optional threshold auto-compaction before starting the run.
     let activePlan = plan;
@@ -1219,43 +1286,28 @@ export class HarnessSession {
       const keepRecentTokens = this.compaction.keepRecentTokens ?? DEFAULT_COMPACTION_KEEP_RECENT_TOKENS;
       if (
         contextWindow > 0 &&
-        estimateTranscriptTokens(activePlan.preRunMessages) > contextWindow - reserveTokens
+        estimateTranscriptTokens(activePlan.preRunContextMessages) > contextWindow - reserveTokens
       ) {
-        const compacted = await this.runCompactionOnMessages(
-          this.agent.state.messages,
+        const compactionSourceMessages =
+          activePlan.kind === "prompt" ? this.committedSnapshot.messages : activePlan.preRunFullMessages;
+        const compacted = await this.runCompactionCheckpoint({
+          fullMessages: compactionSourceMessages,
+          compactions: this.compactionCheckpoints,
           keepRecentTokens,
-          undefined,
-          runHandle.abortController.signal,
-        );
+          trigger: "threshold",
+          instructions: undefined,
+          signal: runHandle.abortController.signal,
+        });
         if (compacted.compacted) {
-          this.agent.state.messages = structuredClone(compacted.nextMessages);
-          this.customEntries.push({
-            id: generateRandomId(),
-            customType: "harness.compaction",
-            data: {
-              trigger: "threshold",
-              summary: compacted.result.summary,
-              compactedMessages: compacted.result.compactedMessages,
-              keptMessages: compacted.result.keptMessages,
-              tokensBefore: compacted.result.tokensBefore,
-              tokensAfter: compacted.result.tokensAfter,
-            },
-            timestamp: this.now(),
-          });
-          if (activePlan.kind === "prompt") {
-            activePlan = {
-              ...activePlan,
-              preRunMessages: [
-                ...structuredClone(compacted.nextMessages),
-                ...structuredClone(activePlan.pendingMessages),
-              ],
-            };
-          } else {
-            activePlan = {
-              ...activePlan,
-              preRunMessages: structuredClone(compacted.nextMessages),
-            };
-          }
+          this.compactionCheckpoints = [...this.compactionCheckpoints, compacted.checkpoint];
+          this.agent.state.messages = structuredClone(compacted.nextContextMessages);
+          activePlan = {
+            ...activePlan,
+            preRunContextMessages: projectContextMessages(
+              activePlan.preRunFullMessages,
+              this.compactionCheckpoints,
+            ),
+          };
         }
       }
     }
@@ -1270,7 +1322,8 @@ export class HarnessSession {
     }
 
     const preRunSnapshot = this.buildSnapshot({
-      messages: activePlan.preRunMessages,
+      messages: activePlan.preRunFullMessages,
+      compactions: this.compactionCheckpoints,
       status: "running",
       lastError: undefined,
     });
@@ -1280,15 +1333,17 @@ export class HarnessSession {
     try {
       await this.store.save(this.sessionId, preRunSnapshot);
     } catch (error) {
-      this.agent.state.messages = beforeMessages;
+      this.agent.state.messages = beforeAgentMessages;
+      this.compactionCheckpoints = beforeCompactions;
       this.customEntries = beforeCustomEntries;
       throw error;
     }
     this.committedSnapshot = structuredClone(preRunSnapshot);
 
+    let runFullMessages = structuredClone(preRunSnapshot.messages);
     if (runHandle.abortRequested) {
-      this.agent.state.messages = structuredClone(preRunSnapshot.messages);
-      return this.commitFinalSnapshot(preRunSnapshot, preRunSnapshot.messages, "aborted", undefined);
+      this.agent.state.messages = projectContextMessages(runFullMessages, this.compactionCheckpoints);
+      return this.commitFinalSnapshot(preRunSnapshot, runFullMessages, "aborted", undefined);
     }
 
     const maxRetries = this.retry ? (this.retry.maxRetries ?? DEFAULT_RETRY_MAX_RETRIES) : 0;
@@ -1302,58 +1357,54 @@ export class HarnessSession {
     let firstInvocation = true;
 
     while (true) {
-      const attemptBaseline = this.agent.state.messages.length;
       this.completedTurnsInRun = 0;
       this.maxTurnsReachedInRun = false;
 
+      let producedMessages: AgentMessage[];
       if (firstInvocation && activePlan.kind === "prompt") {
         firstInvocation = false;
+        const producedStart = this.agent.state.messages.length + activePlan.pendingMessages.length;
         await this.agent.prompt(activePlan.pendingMessages);
+        producedMessages = this.agent.state.messages.slice(producedStart);
       } else {
         if (firstInvocation) {
           firstInvocation = false;
-          this.agent.state.messages = structuredClone(activePlan.preRunMessages);
+          this.agent.state.messages = structuredClone(activePlan.preRunContextMessages);
         }
+        const producedStart = this.agent.state.messages.length;
         await this.agent.continue();
+        producedMessages = this.agent.state.messages.slice(producedStart);
       }
 
-      const producedMessages = this.agent.state.messages.slice(attemptBaseline);
       lastAssistant = findLastAssistantMessage(producedMessages);
 
       if (runHandle.abortRequested || this.maxTurnsReachedInRun || lastAssistant?.stopReason !== "error") {
+        runFullMessages.push(...structuredClone(producedMessages));
         break;
       }
 
-      // Overflow recovery via compaction (at most once per run).
+      // Overflow recovery via non-destructive compaction checkpoint (at most once per run).
       if (
         this.compaction?.enabled === true &&
         !overflowRecoveryAttempted &&
         isContextOverflow(lastAssistant, this.effectiveContextWindow() || undefined)
       ) {
         overflowRecoveryAttempted = true;
-        const stripped = stripTrailingFailedAssistants(this.agent.state.messages);
+        const keptFromAttempt = stripTrailingFailedAssistants(producedMessages);
+        const candidateFullMessages = [...runFullMessages, ...structuredClone(keptFromAttempt)];
         const keepRecentTokens = this.compaction.keepRecentTokens ?? DEFAULT_COMPACTION_KEEP_RECENT_TOKENS;
-        const compacted = await this.runCompactionOnMessages(
-          stripped,
+        const compacted = await this.runCompactionCheckpoint({
+          fullMessages: candidateFullMessages,
+          compactions: this.compactionCheckpoints,
           keepRecentTokens,
-          undefined,
-          runHandle.abortController.signal,
-        );
+          trigger: "overflow",
+          instructions: undefined,
+          signal: runHandle.abortController.signal,
+        });
         if (compacted.compacted && !runHandle.abortRequested) {
-          this.agent.state.messages = structuredClone(compacted.nextMessages);
-          this.customEntries.push({
-            id: generateRandomId(),
-            customType: "harness.compaction",
-            data: {
-              trigger: "overflow",
-              summary: compacted.result.summary,
-              compactedMessages: compacted.result.compactedMessages,
-              keptMessages: compacted.result.keptMessages,
-              tokensBefore: compacted.result.tokensBefore,
-              tokensAfter: compacted.result.tokensAfter,
-            },
-            timestamp: this.now(),
-          });
+          runFullMessages = candidateFullMessages;
+          this.compactionCheckpoints = [...this.compactionCheckpoints, compacted.checkpoint];
+          this.agent.state.messages = structuredClone(compacted.nextContextMessages);
           continue;
         }
       }
@@ -1370,12 +1421,16 @@ export class HarnessSession {
         });
         await sleep(delayMs, runHandle.abortController.signal);
         if (runHandle.abortRequested) {
+          runFullMessages.push(...structuredClone(producedMessages));
           break;
         }
+        const keptFromAttempt = stripTrailingFailedAssistants(producedMessages);
+        runFullMessages.push(...structuredClone(keptFromAttempt));
         this.agent.state.messages = stripTrailingFailedAssistants(this.agent.state.messages);
         continue;
       }
 
+      runFullMessages.push(...structuredClone(producedMessages));
       break;
     }
 
@@ -1395,14 +1450,18 @@ export class HarnessSession {
       finalStatus = "idle";
     }
 
-    const finalMessages = structuredClone(this.agent.state.messages);
-    const tail = finalMessages[finalMessages.length - 1];
+    const tail = runFullMessages[runFullMessages.length - 1];
     if (tail && isEmptyAbortedAssistantMessage(tail)) {
-      finalMessages.pop();
-      this.agent.state.messages = structuredClone(finalMessages);
+      runFullMessages.pop();
+      const agentTail = this.agent.state.messages[this.agent.state.messages.length - 1];
+      if (agentTail && isEmptyAbortedAssistantMessage(agentTail)) {
+        const trimmed = structuredClone(this.agent.state.messages);
+        trimmed.pop();
+        this.agent.state.messages = trimmed;
+      }
     }
 
-    return this.commitFinalSnapshot(preRunSnapshot, finalMessages, finalStatus, lastError);
+    return this.commitFinalSnapshot(preRunSnapshot, runFullMessages, finalStatus, lastError);
   }
 
   private async commitFinalSnapshot(
@@ -1413,6 +1472,7 @@ export class HarnessSession {
   ): Promise<SessionRunResult> {
     const finalSnapshot = this.buildSnapshot({
       messages: finalMessages,
+      compactions: this.compactionCheckpoints,
       status,
       lastError,
     });
@@ -1421,7 +1481,11 @@ export class HarnessSession {
       await this.store.save(this.sessionId, finalSnapshot);
     } catch (error) {
       // Keep memory aligned with the last committed snapshot and force reopen.
-      this.agent.state.messages = structuredClone(rollbackSnapshot.messages);
+      this.compactionCheckpoints = structuredClone(rollbackSnapshot.compactions ?? []);
+      this.agent.state.messages = projectContextMessages(
+        rollbackSnapshot.messages,
+        this.compactionCheckpoints,
+      );
       this.customEntries = structuredClone(rollbackSnapshot.customEntries ?? []);
       this.committedSnapshot = structuredClone(rollbackSnapshot);
       this.invalidated = true;

@@ -7,7 +7,7 @@ import type {
   ToolExecutionMode,
 } from "@earendil-works/pi-agent-core";
 import type { ClientIdentity, Models, ThinkingBudgets } from "@earendil-works/pi-ai";
-import type { CompactionOptions } from "./compaction.js";
+import type { CompactionCheckpoint, CompactionOptions } from "./compaction.js";
 import type {
   ExtensionDiagnostic,
   ExtensionExecFn,
@@ -44,6 +44,8 @@ export interface SessionSnapshot {
   readonly title?: string;
   readonly parentSessionId?: string;
   readonly messages: AgentMessage[];
+  /** Non-destructive compaction checkpoints; the newest checkpoint governs model context projection. */
+  readonly compactions?: CompactionCheckpoint[];
   readonly customEntries?: CustomSessionEntry[];
   readonly status: SessionStatus;
   readonly lastError?: string;
