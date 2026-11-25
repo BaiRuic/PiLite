@@ -18,7 +18,7 @@
 
 第一版交付为可嵌入的 TypeScript 库，不提供 CLI、TUI 或内置 coding tools。宿主直接注入工具；事件和取消沿用 core 的能力，不另建一套协议。运行入口由 harness 控制，以确保调用不会绕过会话保存边界。
 
-- 单会话同一时刻只允许一个运行中的 run，运行期间再次调用直接拒绝（第一版不暴露 `steer` / `followUp`）。
+- 单会话同一时刻只允许一个运行中的 run，运行期间再次调用 `prompt()`/`continue()` 直接拒绝；支持在运行期间通过 `steer()`（工具轮次后插队纠偏）与 `followUp()`（本轮结束后自动追问）排队消息（`steeringMode` / `followUpMode` 可配置，空闲态拒绝并返回 `SESSION_IDLE`，`abort()` 及 run 结束时自动清空未消费队列）。
 - 透传 `sessionId` 给 `Agent` 以复用 provider 缓存；透传 `identity`（默认不附带 `pi` 归属头，由宿主按需指定）；通过 `finishTurn` 提供可选的 `maxTurns` 护栏防止 headless 场景下工具死循环。
 - 会话操作与长对话支持：支持独立分叉 `fork()`（生成新 `sessionId`、禁止在 `toolCall`/`toolResult` 对中间切分）、idle 态切换 `setModel()` / `setThinkingLevel()` / `setTitle()`、`reset(handoff?)`、`getStats()` 用量汇总，以及按需开启的瞬时错误自动重试（`retry`）与手动/自动上下文压缩（`compact()` / `compaction`，包含超阈值与上下文溢出恢复）。
 
@@ -26,13 +26,11 @@
 
 1. 宿主通过 `pi-ai` 的 `createModels()` 创建模型注册表、注册 provider（动态目录 provider 由宿主在注入前完成 `models.refresh()`）；认证完全在 `Models`/provider 一侧处理，harness 不额外注入 `getApiKey` 以免覆盖 OAuth 等凭据解析。
 2. 会话只保存 `ModelRef = { provider: string; modelId: string }`，不保存凭证或 provider 实现。
-3. harness 用 `models.getModel(provider, modelId)` 解析模型，把 `models.streamSimple.bind(models)` 作为 `streamFn` 传给 `Agent`。模型不可用时显式报错，不静默切换到其他模型。
-
-第一版只接收固定的 `Models` 实例，不实现 `pi-durable` 的 `() => Models` 热替换能力，也不另造 provider 接口。
+3. harness 支持传入固定 `Models` 实例或热替换工厂 `() => Models`（`ModelsProvider`），每次 run 与模型请求前按 `ModelRef` 重新解析最新模型配置；模型不可用时显式报错（`MODEL_NOT_FOUND`），不静默切换到其他模型。
 
 ### 会话存储与恢复
 
-定义面向会话的 `SessionStore`，提供 `load(sessionId)`（不存在返回 `null`）、原子替换快照的 `save(sessionId, snapshot)`、`delete(sessionId)` 和 `list()`（返回按 `updatedAt` 倒序的 `SessionSummary[]`）。快照包含格式版本、模型引用、思考等级、可选标题与父会话引用、消息历史、可选扩展自定义条目（`customEntries`）和运行状态（`idle | running | aborted | interrupted | error`）。参考 `pi-durable` 的多后端 + 运行时隔离抽象，通过独立 subpath 提供内存、SQLite（可移植核心 + `node:sqlite` / `bun:sqlite` 适配器）、JSONL（可移植 `JsonlFileSystem` 核心 + `node:fs` 适配，支持崩溃半截尾行恢复与压缩）和 IndexedDB 后端，所有后端共用同一套契约测试。当前不支持多个进程并发写同一会话。
+定义面向会话的 `SessionStore`，提供 `load(sessionId)`（不存在返回 `null`）、原子替换快照的 `save(sessionId, snapshot)`、`delete(sessionId)`、`list(query?)`（支持按 `parentSessionId` / `status` 过滤与基于 `updatedAt DESC, sessionId ASC` 的游标分页 `{ items, nextCursor? }`）及可选 `close?()`。快照包含格式版本、模型引用、思考等级、可选标题与父会话引用、消息历史、可选扩展自定义条目（`customEntries`）和运行状态（`idle | running | aborted | interrupted | error`）。参考 `pi-durable` 的多后端 + 运行时隔离抽象，通过独立 subpath 提供内存、SQLite（可移植核心 + `node:sqlite` / `bun:sqlite` 适配器）、JSONL（可移植 `JsonlFileSystem` 核心 + `node:fs` 适配，支持崩溃半截尾行恢复与压缩）和 IndexedDB 后端，所有后端共用同一套契约测试。当前不支持多个进程并发写同一会话。
 
 - **提交粒度（Run 级）**：开始运行前，保存用户输入和 `running` 状态，保存失败就不启动运行；运行结束后，将完整消息和最终状态一次提交。流式事件可提前展示，但不代表已经持久化。这是第一版为简化原子边界的有意取舍——崩溃时不会产生半截工具调用，代价是同一次 run 中已完成的中间工具轮次也会回退。
 - **终态判定与取消**：`pi-agent-core` 会把模型错误和取消编码在末尾 `AssistantMessage.stopReason`（`"error" | "aborted"`）中，而不会让 `prompt()` reject。harness 根据取消状态与末尾 `stopReason` 写入最终状态（`idle` / `aborted` / `error`），过滤无内容且无错误信息的空 `aborted` 尾消息；保留的非空 `aborted` / `error` 消息可供宿主展示，后续请求依赖 `pi-ai` 的 `transformMessages` 自动跳过它们。`abort()` 记录启动前取消意图并等待本轮 settle 与最终保存完成后返回。
@@ -49,7 +47,7 @@
 
 参考 `pi-coding-agent` 的扩展模型提供轻量 headless 扩展层（`ExtensionFactory = (pi) => void | Promise<void>`），由宿主以代码方式显式注册，不引入磁盘动态 `.ts` 加载（`jiti`）和 TUI 依赖：
 
-- 支持注册与动态启停工具（`registerTool`、`getActiveTools` / `setActiveTools`）、拦截与生命周期钩子（`session_start` / `session_shutdown`、`before_agent_start`、`context`、`tool_call`、`tool_result`、`before_provider_request` / `after_provider_response` 及全部 core 事件）。
+- 支持注册与动态启停工具（`registerTool`、`getActiveTools` / `setActiveTools`）、嵌套工具调用（`ctx.executeTool()` 基于 `pi-agent-core` 的 `runToolCall()` 执行并透传 `parentToolCallId` 经过校验与 `tool_call`/`tool_result` 钩子）、拦截与生命周期钩子（`session_start` / `session_shutdown`、`before_agent_start`、`context`、`tool_call`、`tool_result`、`before_provider_request` / `after_provider_response` 及全部 core 事件）。
 - 支持 `appendEntry` 持久化扩展自定义条目（随快照原子提交与回滚）、共享 `events` 总线，以及宿主按需注入的 `ui` / `exec` 桥接适配器；未支持的事件名接受注册并输出 `deferred_event` 诊断，不阻塞运行。
 
 ## 第一阶段验收
