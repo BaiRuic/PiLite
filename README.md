@@ -1,41 +1,42 @@
 # pi-harness
 
-轻量、可嵌入、无头（Headless）的 TypeScript Agent Harness，基于 [`@earendil-works/pi-agent-core`](https://www.npmjs.com/package/@earendil-works/pi-agent-core) 与 [`@earendil-works/pi-ai`](https://www.npmjs.com/package/@earendil-works/pi-ai) 构建。
+A lightweight, embeddable, headless TypeScript agent harness built on [`@earendil-works/pi-agent-core`](https://www.npmjs.com/package/@earendil-works/pi-agent-core) and [`@earendil-works/pi-ai`](https://www.npmjs.com/package/@earendil-works/pi-ai).
 
-为桌面端、服务端、CLI 或边缘宿主提供一个**开箱即用但不绑死 UI / 工具 / 运行时**的 Agent 会话与模型管理层，并支持通过 Bun 单文件编译交付到无 Node.js 环境。
+Designed for desktop apps, servers, CLIs, and edge hosts that need an embedded agent session and model-management runtime without inheriting a UI, built-in coding tools, or a heavyweight durable workflow engine — and verified to compile into standalone Bun binaries for environments without Node.js.
 
-## 亮点与核心能力
+## Highlights
 
-- **轻量无头会话引擎**：Run 级原子持久化与失败回滚、崩溃重开识别 `interrupted`（不自动重放副作用）、`abort()` 取消收敛、运行中 `steer()` 插队纠偏与 `followUp()` 追问排队。
-- **长对话与会话运维**：独立分叉 `fork()`（禁止在 `toolCall`/`toolResult` 中间切分）、空闲态切换模型/思考等级/标题、`reset(handoff?)`、`getStats()` 用量汇总、瞬时错误自动重试（`retry`）、手动/超阈值/溢出自动上下文压缩（`compact`）。
-- **多端可移植存储**：`SessionStore` 支持按 `parentSessionId`/`status` 过滤与游标分页，内置 Memory、SQLite（Node `node:sqlite` + Bun `bun:sqlite`，零原生 C++ addon）、JSONL（崩溃半截尾行修复）、IndexedDB 四套后端并共用同一套契约测试。
-- **统一模型管理（可选 `pi-harness/models`）**：支持 `Models | (() => Models)` 热替换；通过 `ModelHub` 统一组装内置 OAuth 订阅登录（CLI 桥接）、自建 JWT/API 后端动态拉取、本地抽象配置源（JSON/JSONC + 覆盖 + `/models` 探测）、SQLite/文件凭据与目录缓存，以及平级 OpenAI 兼容 `EmbeddingProvider`。
-- **Headless 扩展层（`pi-harness/extensions`）**：代码注册 `ExtensionFactory`，支持动态启停工具、嵌套 `ctx.executeTool()`、全生命周期拦截钩子、随快照原子持久化的 `appendEntry`，以及可选 `ui`/`exec` 桥接。
-- **单文件部署友好**：零原生 C++ 依赖，完整验证 `bun build --compile` 单文件可执行产物在无 Node.js 环境中运行。
+- **Headless Session Engine**: Run-level atomic persistence with rollback on save failure, crash recovery marking unfinished runs as `interrupted` without auto-replaying side effects, `abort()` settling, and live-run `steer()` / `followUp()` queues.
+- **Long-Conversation & Session Operations**: Independent `fork()` (guarding `toolCall`/`toolResult` boundaries), idle-time `setModel()` / `setThinkingLevel()` / `setTitle()`, `reset(handoff?)`, `getStats()`, transient error auto-`retry`, and manual / threshold / overflow `compact()`.
+- **Portable Multi-Backend Storage**: `SessionStore` with `parentSessionId` / `status` filtering and keyset cursor pagination across Memory, SQLite (`node:sqlite` + `bun:sqlite`, zero native C++ addons), JSONL (with truncated tail recovery & compaction), and IndexedDB — all validated by one shared contract suite.
+- **Unified Model Management (Optional `pi-harness/models`)**: Hot-swappable `Models | (() => Models)` injection; `ModelHub` composing built-in OAuth subscription flows (with a CLI interaction bridge), self-hosted JWT/API backends, abstract `LocalModelSource` configs (JSON/JSONC + overlays + `/models` discovery), SQLite/file credential & catalog stores, and a peer OpenAI-compatible `EmbeddingProvider`.
+- **Headless Extensions (`pi-harness/extensions`)**: Code-registered `ExtensionFactory` supporting dynamic tool activation, nested `ctx.executeTool()` (via `runToolCall()`), lifecycle & interception hooks, atomically persisted `appendEntry`, a shared event bus, and optional `ui` / `exec` adapters.
+- **Single-Binary Deployment Friendly**: Zero native C++ addons; verified end-to-end with `bun build --compile` in a clean `PATH` without Node.js.
 
-## 与 `pi-durable` / `pi-coding-agent` 的区别
+## Comparison with `pi-durable` and `pi-coding-agent`
 
-| 维度 | `pi-coding-agent` | `pi-durable` | `pi-harness`（本项目） |
+| Dimension | `pi-coding-agent` | `pi-durable` | `pi-harness` |
 | --- | --- | --- | --- |
-| **定位** | 面向编程场景的完整 CLI / TUI 应用 | 持久化任务状态机（Workflow / Durable Execution） | **可嵌入的无头 Agent 运行层库** |
-| **交互界面与内置工具** | 自带 TUI、CLI 与 `read`/`write`/`edit`/`bash` 等 coding tools | 无 UI；可选内置 coding tools + `ExecutionEnv` | **不内置 UI 与 coding tools**，全部由宿主按需注入 |
-| **崩溃恢复策略** | 恢复本地会话历史 | 持久化任务 checkpoint，重启后**自动恢复并重放未完成执行** | **只恢复会话历史，不自动重放**：崩溃轮次标为 `interrupted`，由宿主显式决定 `continue()` 或新 `prompt()` |
-| **存储与部署复杂度** | 面向本地文件系统（JSONL） | 需维护文档/任务图/信号/调度器（适配云端/DO） | 轻量 Run 级快照 `SessionStore`（Memory / SQLite / JSONL / IndexedDB），零原生 addon，适配 Bun 单文件分发 |
-| **扩展与模型接入** | 支持磁盘动态 `.ts` 插件（`jiti`）与完整 `ModelRuntime` | 纯代码注册扩展，纯注入 `Models` | 代码注册 headless 扩展（无 `jiti`/TUI 依赖）；核心纯注入 `Models \| (() => Models)`，同时提供轻量可选 `pi-harness/models` 组装 OAuth / JWT 后端 / 本地配置 / Embedding |
+| **Role** | Full coding CLI / TUI application | Durable execution & workflow state machine | **Embeddable headless agent runtime library** |
+| **UI & Built-in Tools** | Built-in TUI, CLI, and coding tools (`read`/`write`/`edit`/`bash`) | Headless; optional coding tools + `ExecutionEnv` | **No UI or built-in coding tools** — host injects tools directly |
+| **Crash Recovery** | Restores local session history | Checkpointed tasks; **automatically resumes & replays** unfinished runs on restart | **Restores history only, never auto-replays**: interrupted runs become `interrupted`; host chooses `continue()` or new `prompt()` |
+| **Storage & Footprint** | Local JSONL files | Document store, task graph, signals, scheduler (built for servers / Durable Objects) | Lightweight run-level snapshot `SessionStore` (Memory / SQLite / JSONL / IndexedDB), Bun single-binary ready |
+| **Extensions & Models** | Dynamic `.ts` disk plugins (`jiti`) + full `ModelRuntime` | Code-registered extensions + injected `Models` | Code-registered headless extensions (no `jiti`/TUI); core takes `Models \| (() => Models)`, plus optional `pi-harness/models` for OAuth / JWT backends / local configs / embeddings |
 
-**选型直觉**：
-- 需要开箱即用的终端编程助手 → 用 `pi-coding-agent`。
-- 需要跨进程/云端宕机自动断点续跑长任务与定时/信号工作流 → 用 `pi-durable`。
-- 需要在自己的桌面端/服务端/产品里嵌入一个**可控、轻量、不强绑定 UI 和重任务引擎**的 Agent 会话层 → 用 `pi-harness`。
+**When to choose which:**
+- Want a turnkey terminal coding assistant → `pi-coding-agent`.
+- Need durable multi-step workflows that automatically resume across crashes, timers, and external signals → `pi-durable`.
+- Want a lean, predictable agent session & model layer embedded inside your own desktop app, backend, or custom CLI → `pi-harness`.
 
-## 快速上手
+## Quick Start
 
 ```ts
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { createSession } from "pi-harness";
 import { createModelHub } from "pi-harness/models";
 import { createSqliteCredentialStore, createSqliteModelsStore } from "pi-harness/models/sqlite";
-import { openNodeSqliteDatabase, SqliteSessionStore } from "pi-harness/storage/sqlite/node";
+import { SqliteSessionStore } from "pi-harness/storage/sqlite";
+import { openNodeSqliteDatabase } from "pi-harness/storage/sqlite/node";
 
 const db = await openNodeSqliteDatabase("./app.sqlite");
 const store = await SqliteSessionStore.open(db);
@@ -64,33 +65,33 @@ const result = await session.prompt("Hello!");
 console.log("\nstatus:", result.status);
 ```
 
-## 包导出入口
+## Package Exports
 
-| Import Path | 说明 | 源码入口 |
+| Import Path | Description | Source Entry |
 | --- | --- | --- |
-| `pi-harness` | 核心会话 API（`createSession`、`openSession`、`HarnessSession`、`InMemorySessionStore` 等） | [src/index.ts](src/index.ts) |
-| `pi-harness/extensions` | Headless 扩展 API（`defineTool`、`ExtensionRunner` 及类型） | [src/extensions/index.ts](src/extensions/index.ts) |
-| `pi-harness/models` | 可移植模型管理核心（`createModelHub`、`createApiBackendProvider`、`LocalModelSource`、`createOpenAIEmbeddingProvider`） | [src/models/index.ts](src/models/index.ts) |
-| `pi-harness/models/sqlite` | 可移植 SQLite `CredentialStore` & `ModelsStore` | [src/models/sqlite/index.ts](src/models/sqlite/index.ts) |
-| `pi-harness/models/node` | Node/Bun 文件存储、JSONC 本地源、CLI OAuth 交互桥接 | [src/models/node/index.ts](src/models/node/index.ts) |
+| `pi-harness` | Core session API (`createSession`, `openSession`, `HarnessSession`, `InMemorySessionStore`) | [src/index.ts](src/index.ts) |
+| `pi-harness/extensions` | Headless extension API (`defineTool`, `ExtensionRunner`, hook types) | [src/extensions/index.ts](src/extensions/index.ts) |
+| `pi-harness/models` | Portable model hub, API backend factory, `LocalModelSource`, `EmbeddingProvider` | [src/models/index.ts](src/models/index.ts) |
+| `pi-harness/models/sqlite` | Portable SQLite `CredentialStore` & `ModelsStore` | [src/models/sqlite/index.ts](src/models/sqlite/index.ts) |
+| `pi-harness/models/node` | Atomic JSON file stores, JSONC model source, CLI OAuth interaction bridge | [src/models/node/index.ts](src/models/node/index.ts) |
 | `pi-harness/storage/*` | `memory` / `sqlite` (`node`, `bun`) / `jsonl` (`node`) / `indexeddb` | [src/store/](src/store/) |
-| `pi-harness/testing` | `SessionStore` / `CredentialStore` / `ModelsStore` 公共契约测试 | [src/testing.ts](src/testing.ts) |
+| `pi-harness/testing` | Shared contract test suites for `SessionStore`, `CredentialStore`, and `ModelsStore` | [src/testing.ts](src/testing.ts) |
 
-## 设计文档
+## Documentation
 
-文档以源码为单一信息源，仅记录架构边界、关键取舍与索引路径：
+Source code is the single source of truth; the docs below focus strictly on architectural boundaries, invariants, and pointers to code:
 
-- [docs/architecture.md](docs/architecture.md) — 动机、分层边界、非目标与 Bun 部署策略
-- [docs/session.md](docs/session.md) — 会话生命周期、原子提交、崩溃恢复、队列与压缩重试
-- [docs/storage.md](docs/storage.md) — `SessionStore` 契约、过滤分页与多端存储后端
-- [docs/models-and-extensions.md](docs/models-and-extensions.md) — 模型注入/热替换、`ModelHub`、Embedding 与 Headless 扩展层
+- [docs/architecture.md](docs/architecture.md) — Motivation, layering, explicit non-goals, and Bun packaging verification
+- [docs/session.md](docs/session.md) — Session lifecycle, atomic commits, crash recovery, queues, retry, and compaction
+- [docs/storage.md](docs/storage.md) — `SessionStore` contract, filtered cursor pagination, and portable backends
+- [docs/models-and-extensions.md](docs/models-and-extensions.md) — Model hot-swapping, `ModelHub`, embeddings, and headless extensions
 
-## 开发与验证
+## Development & Verification
 
 ```bash
-pnpm check            # Biome 格式/Lint 检查 + 严格 TypeScript 类型检查
-pnpm check:fix        # 自动格式化/修复 + 类型检查
-pnpm test             # 构建并运行全部 Vitest 测试
-pnpm test:bun         # 运行 Bun SQLite 契约测试
-pnpm build:bun-verify # 编译单文件 Bun 验证产物 dist/verify-bun-host
+pnpm check            # Biome format/lint check + strict TypeScript typecheck
+pnpm check:fix        # Auto-format/fix + typecheck
+pnpm test             # Build and run all Vitest suites
+pnpm test:bun         # Run Bun SQLite contract suites
+pnpm build:bun-verify # Compile standalone Bun verification binary (dist/verify-bun-host)
 ```

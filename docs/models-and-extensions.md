@@ -1,28 +1,28 @@
-# 模型接入与 Headless 扩展
+# Models & Headless Extensions
 
-> 源码单一信息源：[src/models/](../src/models/)、[src/extensions/](../src/extensions/)。
+> Single source of truth: [src/models/](../src/models/) and [src/extensions/](../src/extensions/).
 
-## 模型接入
+## Model Integration
 
-### 核心会话层（零侵入）
-- 会话只持久化 `ModelRef = { provider, modelId }`，不存密钥或 provider 实现。
-- 认证、OAuth 刷新与目录管理完全交由 `pi-ai` `Models` 处理；核心支持传入固定 `Models` 或热替换工厂 `() => Models`（`ModelsProvider`），每次 run 与模型请求前重新解析，模型缺失时显式抛 `MODEL_NOT_FOUND`。
+### Core Session Layer
+- Sessions persist only `ModelRef = { provider, modelId }` — never credentials or provider implementations.
+- Auth resolution, OAuth token refresh, and provider dispatch live in `pi-ai`'s `Models`. The session accepts `Models | (() => Models)` (`ModelsProvider`) so registries can be hot-swapped between runs; missing models raise `MODEL_NOT_FOUND` rather than falling back silently.
 
-### 可选模型管理模块（`pi-harness/models*`）
-在不侵入 `HarnessSession` 的前提下，把常见宿主需求封装为薄组装层，最终统一输出标准 `Models`：
+### Optional Model Hub (`pi-harness/models*`)
+A thin, opt-in assembly layer that produces a standard `pi-ai` `Models` registry without coupling `HarnessSession` to auth or config I/O:
 
-- **`pi-harness/models`（可移植核心）**：
-  - `createModelHub()`：统一组装内置/OAuth provider、自建后端、本地配置源及持久化存储，通过 `hub.asModelsProvider()` 热接入会话。
-  - `createApiBackendProvider()`：面向自建 HTTP/JWT 后端，支持动态 `getAuth()`、混合 wire 协议懒加载、默认兼容 OpenAI `/models` 解析或自定义 `parseModels`/`fetchModels`。
-  - `LocalModelSource` 与覆写合并器：抽象本地配置来源，支持无密钥本地服务（Ollama/vLLM）自动探测与 `compat` 默认值、对内置厂商做 `baseUrl`/`headers`/`modelOverrides` 局部覆写；默认仅开启 `$ENV`/`${ENV}` 插值，`!command` 需显式传入 `execCommand` 才启用。
-  - `EmbeddingProvider` / `createOpenAIEmbeddingProvider()`：与 `pi-ai` 对话/分类模型平级，支持在 `ModelHub` 中声明、按鉴权状态筛选（`getAvailableEmbeddingModels()`）、选择并复用 `ModelHub` 鉴权调用 OpenAI 兼容 `/embeddings`，附带稳定 `fingerprint()` 供向量索引重建判断。
-- **`pi-harness/models/sqlite`**：复用 `SqliteDatabase` 提供 `SqliteCredentialStore`（事务串行防并发双刷 OAuth token）与 `SqliteModelsStore`（目录离线缓存），可与 `SqliteSessionStore` 共用同一 DB。
-- **`pi-harness/models/node`**：提供原子 JSON 文件存储（`FileCredentialStore`/`FileModelsStore`）、JSON/JSONC 本地源（`createJsonFileModelSource()`）与纯 `node:readline` 的 OAuth CLI 交互桥接（`createCliAuthInteraction()`）。
+- **`pi-harness/models` (portable core)**:
+  - `createModelHub()` — combines built-in/OAuth providers, custom API backends, abstract local sources, and persistent stores; exposes `hub.asModelsProvider()` for live hot-swapping.
+  - `createApiBackendProvider()` — wraps self-hosted HTTP/JWT backends with dynamic `getAuth()`, lazy wire-API dispatch (`openai-completions`, `openai-responses`, `anthropic-messages`, `google-generative-ai`), default OpenAI `/models` parsing, and custom `parseModels` / `fetchModels`.
+  - `LocalModelSource` & overlays — abstract config loader supporting keyless local servers (e.g. Ollama/vLLM) with optional `/models` discovery and local `compat` defaults, plus `baseUrl` / `headers` / `modelOverrides` overlays onto existing providers. Supports `$VAR` / `${VAR}` interpolation; `!command` is disabled unless `execCommand` is explicitly provided.
+  - `EmbeddingProvider` & `createOpenAIEmbeddingProvider()` — peer abstraction for OpenAI-compatible `POST /embeddings` endpoints (standalone or reusing `ModelHub` auth), with `hub.getEmbeddingModels()`, `hub.getAvailableEmbeddingModels()`, `hub.createEmbeddingProvider()`, response/dimension validation, L2 normalization, and non-secret `fingerprint()` for index invalidation.
+- **`pi-harness/models/sqlite`**: Portable `SqliteCredentialStore` (transaction-serialized `modify()` preventing concurrent OAuth refresh races) and `SqliteModelsStore` (offline catalog cache), safe to share one SQLite DB with `SqliteSessionStore`.
+- **`pi-harness/models/node`**: Atomic JSON `FileCredentialStore` / `FileModelsStore`, JSON/JSONC `createJsonFileModelSource()`, and `node:readline`-based `createCliAuthInteraction()` for interactive OAuth CLI login.
 
-## Headless 扩展层（`pi-harness/extensions`）
+## Headless Extensions (`pi-harness/extensions`)
 
-参考 `pi-coding-agent` 的扩展接口，由宿主以代码形式注册 `ExtensionFactory = (pi) => void | Promise<void>`，不含磁盘加载与 TUI 依赖：
+Modeled after `pi-coding-agent`'s `ExtensionAPI` for explicit code registration (`ExtensionFactory = (pi) => void | Promise<void>`) without TUI or `jiti`:
 
-- **工具管理与嵌套执行**：支持 `registerTool`、`getActiveTools`/`setActiveTools` 动态启停；工具内可通过 `ctx.executeTool(name, args, options?)` 基于 `pi-agent-core` 的 `runToolCall()` 调用其他已注册工具（含对模型隐藏的内部工具），统一经过 schema 校验与 `tool_call`/`tool_result` 钩子并透传 `parentToolCallId`。
-- **生命周期与拦截钩子**：支持 `session_start`/`session_shutdown`、`before_agent_start`、`context`、`tool_call`、`tool_result`、`before_provider_request`/`after_provider_response` 及全部 core 事件；未支持事件输出 `deferred_event` 诊断而不阻塞运行。
-- **状态与宿主桥接**：`pi.appendEntry()` 写入的自定义条目随会话快照原子提交与回滚；提供共享 `pi.events` 总线与可选 `ui`/`exec` 适配器。
+- **Tools & nested execution**: `registerTool`, `getActiveTools` / `setActiveTools`, and `ctx.executeTool(name, args, options?)` backed by `pi-agent-core`'s `runToolCall()` so nested calls (including tools hidden from the model) go through schema validation and `tool_call` / `tool_result` hooks with `parentToolCallId`.
+- **Lifecycle & interception hooks**: `session_start`, `session_shutdown`, `before_agent_start`, `context`, `tool_call`, `tool_result`, `before_provider_request`, `after_provider_response`, and all `pi-agent-core` events. Unsupported event names emit a `deferred_event` diagnostic instead of failing.
+- **State & host bridges**: `pi.appendEntry()` persists custom entries atomically with the session snapshot; `pi.events` provides an in-session event bus; optional `ui` and `exec` host adapters degrade safely when omitted.
