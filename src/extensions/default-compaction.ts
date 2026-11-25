@@ -1,4 +1,4 @@
-import type { ClientIdentity, Models } from "@earendil-works/pi-ai";
+import type { Api, ClientIdentity, Model, Models, Usage } from "@earendil-works/pi-ai";
 import { type CompactionSummarizer, defaultSummarizeMessages } from "../compaction.js";
 import { HarnessError } from "../types.js";
 import type { ExtensionFactory } from "./types.js";
@@ -13,6 +13,8 @@ export interface DefaultCompactionExtensionOptions {
   readonly identity?: ClientIdentity;
   /** Optional custom summarizer; defaults to `defaultSummarizeMessages`. */
   readonly summarizer?: CompactionSummarizer;
+  /** Invoked if a built-in summarization call fails after incurring provider usage. */
+  readonly onFailedUsage?: (usage: Usage, model: Model<Api>) => void;
 }
 
 /**
@@ -20,7 +22,7 @@ export interface DefaultCompactionExtensionOptions {
  *
  * `HarnessSession` automatically appends this extension at the end of its extension list so
  * user-registered `session_before_compact` handlers run first and can cancel compaction,
- * adjust `customInstructions`, or supply a custom `summary` / `firstKeptIndex` / `details`.
+ * adjust `customInstructions`, or supply a custom `summary` / `firstKeptIndex` / `usage` / `details`.
  *
  * Hosts can also use this factory as a template when writing domain-specific compaction
  * extensions (for example routing summaries to a cheaper model or preserving structured metadata).
@@ -35,7 +37,7 @@ export function createDefaultCompactionExtension(
         throw new HarnessError("MODEL_NOT_FOUND", "Cannot compact session without a resolved model.");
       }
 
-      const summary = options.summarizer
+      const output = options.summarizer
         ? await options.summarizer({
             messages: structuredClone(event.preparation.messagesToSummarize),
             instructions: event.customInstructions,
@@ -49,9 +51,15 @@ export function createDefaultCompactionExtension(
             instructions: event.customInstructions,
             identity: options.identity,
             signal: event.signal,
+            onFailedUsage: (usage) => options.onFailedUsage?.(usage, model),
           });
 
-      return { compaction: { summary } };
+      return {
+        compaction: {
+          summary: output.summary,
+          ...(output.usage !== undefined ? { usage: output.usage } : {}),
+        },
+      };
     });
   };
 }

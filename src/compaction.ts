@@ -8,6 +8,7 @@ import {
   type Model,
   type Models,
   type SystemMessage,
+  type Usage,
 } from "@earendil-works/pi-ai";
 
 const CHARS_PER_TOKEN_ESTIMATE = 4;
@@ -39,6 +40,8 @@ export interface CompactionCheckpoint {
   readonly keptMessages: number;
   readonly tokensBefore: number;
   readonly tokensAfter: number;
+  /** Token/cost usage from the LLM call(s) that produced this summary, if available. */
+  readonly usage?: Usage;
   /** Optional extension-specific metadata persisted alongside this checkpoint. */
   readonly details?: unknown;
   readonly timestamp: number;
@@ -70,7 +73,12 @@ export interface CompactionSummarizerInput {
   readonly signal?: AbortSignal;
 }
 
-export type CompactionSummarizer = (input: CompactionSummarizerInput) => Promise<string>;
+export interface CompactionSummaryOutput {
+  readonly summary: string;
+  readonly usage?: Usage;
+}
+
+export type CompactionSummarizer = (input: CompactionSummarizerInput) => Promise<CompactionSummaryOutput>;
 
 export interface CompactionOptions {
   /** Enable automatic threshold and context-overflow compaction. Defaults to `false`. */
@@ -94,6 +102,7 @@ export interface CompactionResult {
   readonly compacted: boolean;
   readonly summary?: string;
   readonly checkpoint?: CompactionCheckpoint;
+  readonly usage?: Usage;
   readonly compactedMessages: number;
   readonly keptMessages: number;
   readonly tokensBefore: number;
@@ -326,7 +335,9 @@ export async function defaultSummarizeMessages(params: {
   readonly instructions?: string;
   readonly identity?: ClientIdentity;
   readonly signal?: AbortSignal;
-}): Promise<string> {
+  /** Invoked when the summarization response errored/aborted after incurring usage. */
+  readonly onFailedUsage?: (usage: Usage) => void;
+}): Promise<CompactionSummaryOutput> {
   const transcriptText = renderMessagesForSummary(params.messages);
   const promptText = params.instructions
     ? `Additional focus instructions: ${params.instructions}\n\nConversation to summarize:\n\n${transcriptText}`
@@ -343,6 +354,9 @@ export async function defaultSummarizeMessages(params: {
   });
 
   if (response.stopReason === "error" || response.stopReason === "aborted") {
+    if (response.usage) {
+      params.onFailedUsage?.(response.usage);
+    }
     throw new Error(response.errorMessage || `Compaction summarization failed (${response.stopReason})`);
   }
 
@@ -353,10 +367,16 @@ export async function defaultSummarizeMessages(params: {
     .trim();
 
   if (!summary) {
+    if (response.usage) {
+      params.onFailedUsage?.(response.usage);
+    }
     throw new Error("Compaction summarizer returned an empty summary.");
   }
 
-  return summary;
+  return {
+    summary,
+    ...(response.usage !== undefined ? { usage: response.usage } : {}),
+  };
 }
 
 /**

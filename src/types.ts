@@ -6,7 +6,7 @@ import type {
   ThinkingLevel,
   ToolExecutionMode,
 } from "@earendil-works/pi-agent-core";
-import type { ClientIdentity, Models, ThinkingBudgets } from "@earendil-works/pi-ai";
+import type { ClientIdentity, Models, ThinkingBudgets, Usage } from "@earendil-works/pi-ai";
 import type { CompactionCheckpoint, CompactionOptions } from "./compaction.js";
 import type {
   ExtensionDiagnostic,
@@ -134,6 +134,18 @@ export interface RetryOptions {
   readonly sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
 }
 
+export type SessionUsageSource = "turn" | "tool" | "compaction";
+
+/** Usage telemetry emitted whenever a turn, tool, or compaction incurs model usage. */
+export interface SessionUsageEvent {
+  readonly sessionId: string;
+  readonly source: SessionUsageSource;
+  readonly model?: ModelRef;
+  readonly toolName?: string;
+  readonly usage: Usage;
+  readonly timestamp: number;
+}
+
 export interface SessionStats {
   readonly sessionId: string;
   readonly userMessages: number;
@@ -187,6 +199,8 @@ export interface BaseSessionOptions {
   readonly retry?: RetryOptions;
   /** Optional context compaction settings (threshold & overflow recovery). */
   readonly compaction?: CompactionOptions;
+  /** Optional observer invoked whenever a turn, tool, or compaction incurs model usage. */
+  readonly onUsage?: (event: SessionUsageEvent) => void;
   readonly now?: () => number;
 }
 

@@ -7,6 +7,7 @@ export {
   type CompactionResult,
   type CompactionSummarizer,
   type CompactionSummarizerInput,
+  type CompactionSummaryOutput,
   type CompactionTrigger,
   createCompactionSummaryMessage,
   estimateMessageTokens,
@@ -90,6 +91,8 @@ export {
   type SessionStore,
   type SessionSummary,
   type SessionTerminalStatus,
+  type SessionUsageEvent,
+  type SessionUsageSource,
   sortSessionSummaries,
   summarizeSnapshot,
 } from "./types.js";

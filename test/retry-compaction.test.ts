@@ -12,6 +12,7 @@ import {
   type RetryEvent,
   type SessionCompactEvent,
   type SessionCompactFailedEvent,
+  type SessionUsageEvent,
 } from "../src/index.js";
 
 function createTestEnv(contextWindow = 100_000) {
@@ -206,7 +207,7 @@ describe("Auto-retry and context compaction", () => {
             first?.role === "user" &&
             typeof first.content !== "string" &&
             first.content.some((b) => b.type === "text" && b.text.includes("<conversation_summary>"));
-          return includesPreviousSummary ? "Folded summary #2" : "Initial summary #1";
+          return { summary: includesPreviousSummary ? "Folded summary #2" : "Initial summary #1" };
         },
       },
     });
@@ -283,7 +284,7 @@ describe("Auto-retry and context compaction", () => {
         keepRecentTokens: 40,
         summarizer: async ({ messages }) => {
           summariesMade.push(messages.length);
-          return `Compacted ${messages.length} earlier messages.`;
+          return { summary: `Compacted ${messages.length} earlier messages.` };
         },
       },
     });
@@ -321,7 +322,7 @@ describe("Auto-retry and context compaction", () => {
         keepRecentTokens: 10,
         summarizer: async ({ messages }) => {
           overflowSummaries.push(messages.length);
-          return "Overflow summary";
+          return { summary: "Overflow summary" };
         },
       },
     });
@@ -403,7 +404,7 @@ describe("Auto-retry and context compaction", () => {
       compaction: {
         summarizer: async ({ instructions }) => {
           observedInstructions = instructions;
-          return "Built-in summary with custom instructions";
+          return { summary: "Built-in summary with custom instructions" };
         },
       },
     });
@@ -456,5 +457,88 @@ describe("Auto-retry and context compaction", () => {
     expect(failedEvents).toHaveLength(2);
     expect(failedEvents[1]?.fromExtension).toBe(true);
     expect(failedEvents[1]?.errorMessage).toBe("custom summarizer exploded");
+  });
+
+  it("records compaction usage on checkpoints, includes it in getStats(), and emits unified onUsage events", async () => {
+    const { faux, models, store } = createTestEnv();
+    const usageEvents: SessionUsageEvent[] = [];
+
+    const helperTool: AgentTool = {
+      name: "helper",
+      label: "Helper",
+      description: "Returns a tool result with nested usage",
+      parameters: obj({}),
+      execute: async () => ({
+        content: [{ type: "text", text: "ok" }],
+        details: {},
+        usage: {
+          input: 10,
+          output: 5,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 15,
+          cost: { input: 0.01, output: 0.02, cacheRead: 0, cacheWrite: 0, total: 0.03 },
+        },
+      }),
+    };
+
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("helper", {}, { id: "tc-u1" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage(`Turn 1 reply ${"a".repeat(200)}`),
+      fauxAssistantMessage(`Turn 2 reply ${"b".repeat(200)}`),
+      // Built-in compaction summary LLM call
+      fauxAssistantMessage("Compacted summary with tracked usage"),
+    ]);
+
+    const session = await createSession({
+      sessionId: "sess-usage-accounting",
+      models,
+      store,
+      model: { provider: "faux", modelId: "faux-1" },
+      tools: [helperTool],
+      onUsage: (event) => usageEvents.push(event),
+    });
+
+    await session.prompt(`Q1 ${"1".repeat(120)}`);
+    await session.prompt(`Q2 ${"2".repeat(120)}`);
+
+    const statsBeforeCompact = session.getStats();
+    const compacted = await session.compact({ keepRecentTokens: 40 });
+    expect(compacted.compacted).toBe(true);
+    expect(compacted.usage).toBeDefined();
+    expect(compacted.usage!.totalTokens).toBeGreaterThan(0);
+    expect(compacted.checkpoint?.usage).toEqual(compacted.usage);
+
+    // getStats() includes compaction usage on top of turn + tool usage.
+    const statsAfterCompact = session.getStats();
+    expect(statsAfterCompact.tokens.total).toBe(
+      statsBeforeCompact.tokens.total + compacted.usage!.totalTokens,
+    );
+
+    // Reopening from store preserves compaction usage in getStats().
+    const reopened = await openSession({ sessionId: "sess-usage-accounting", models, store });
+    expect(reopened.getStats().tokens.total).toBe(statsAfterCompact.tokens.total);
+
+    // Verify unified onUsage emitted turn, tool, and compaction events.
+    expect(usageEvents.filter((e) => e.source === "turn").length).toBeGreaterThanOrEqual(3);
+    expect(usageEvents.filter((e) => e.source === "tool")).toHaveLength(1);
+    expect(usageEvents.find((e) => e.source === "tool")?.toolName).toBe("helper");
+    expect(usageEvents.filter((e) => e.source === "compaction")).toHaveLength(1);
+
+    // Trigger another compaction where the summarization response errors after incurring tokens.
+    faux.setResponses([
+      fauxAssistantMessage(`Turn 3 reply ${"c".repeat(200)}`),
+      fauxAssistantMessage(`Turn 4 reply ${"d".repeat(200)}`),
+      fauxAssistantMessage([], {
+        stopReason: "error",
+        errorMessage: "upstream timeout after billing",
+      }),
+    ]);
+    await session.prompt(`Q3 ${"3".repeat(120)}`);
+    await session.prompt(`Q4 ${"4".repeat(120)}`);
+    await expect(session.compact({ keepRecentTokens: 40 })).rejects.toThrow("upstream timeout after billing");
+    const compactionUsages = usageEvents.filter((e) => e.source === "compaction");
+    expect(compactionUsages).toHaveLength(2);
+    expect(compactionUsages[1]?.usage.input).toBeGreaterThan(0);
   });
 });

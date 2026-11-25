@@ -5,11 +5,13 @@ import {
   createModelHub,
   createOpenAIEmbeddingProvider,
   createStaticLocalModelSource,
+  type EmbeddingUsageEvent,
 } from "../src/models/index.js";
 
 describe("createOpenAIEmbeddingProvider (standalone)", () => {
-  it("calls POST /embeddings, sorts by index, L2-normalizes by default, and computes stable fingerprints", async () => {
+  it("calls POST /embeddings, sorts by index, L2-normalizes by default, reports usage, and computes stable fingerprints", async () => {
     const requests: Array<{ url: string; headers: Record<string, string>; body: unknown }> = [];
+    const usageEvents: EmbeddingUsageEvent[] = [];
     const mockFetch: typeof globalThis.fetch = async (input, init) => {
       requests.push({
         url: String(input),
@@ -23,6 +25,10 @@ describe("createOpenAIEmbeddingProvider (standalone)", () => {
             { index: 1, embedding: [0, 5] },
             { index: 0, embedding: [3, 4] },
           ],
+          usage: {
+            prompt_tokens: 12,
+            total_tokens: 12,
+          },
         }),
         { status: 200, headers: { "content-type": "application/json" } },
       );
@@ -35,14 +41,15 @@ describe("createOpenAIEmbeddingProvider (standalone)", () => {
       apiKey: "$TEST_EMBED_KEY",
       dimensions: 2,
       configResolver: { env: { TEST_EMBED_KEY: "sk-live-secret" } },
+      onUsage: (event) => usageEvents.push(event),
       fetch: mockFetch,
     });
 
     // Empty input short-circuits without hitting network.
-    expect(await embedder.embed([])).toEqual([]);
+    expect(await embedder.embed([])).toEqual({ embeddings: [] });
     expect(requests).toHaveLength(0);
 
-    const vectors = await embedder.embed(["first", "second"]);
+    const { embeddings: vectors, usage } = await embedder.embed(["first", "second"]);
     expect(requests).toHaveLength(1);
     expect(requests[0]!.url).toBe("https://api.openai.com/v1/embeddings");
     expect(requests[0]!.headers.authorization).toBe("Bearer sk-live-secret");
@@ -51,6 +58,14 @@ describe("createOpenAIEmbeddingProvider (standalone)", () => {
       input: ["first", "second"],
       encoding_format: "float",
       dimensions: 2,
+    });
+    expect(usage).toEqual({ promptTokens: 12, totalTokens: 12 });
+    expect(usageEvents).toHaveLength(1);
+    expect(usageEvents[0]).toMatchObject({
+      providerId: "openai",
+      modelId: "text-embedding-3-small",
+      inputCount: 2,
+      usage: { promptTokens: 12, totalTokens: 12 },
     });
 
     // [3, 4] -> [0.6, 0.8]; [0, 5] -> [0, 1]
@@ -73,10 +88,11 @@ describe("createOpenAIEmbeddingProvider (standalone)", () => {
       fetch: mockFetch,
     });
     const raw = await rawEmbedder.embed(["a", "b"]);
-    expect(raw).toEqual([
+    expect(raw.embeddings).toEqual([
       [3, 4],
       [0, 5],
     ]);
+    expect(raw.usage).toEqual({ promptTokens: 12, totalTokens: 12 });
     expect(requests[1]!.headers.authorization).toBe(undefined);
   });
 

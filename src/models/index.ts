@@ -19,6 +19,9 @@ export {
   type EmbeddingModel,
   type EmbeddingOptions,
   type EmbeddingProvider,
+  type EmbeddingResult,
+  type EmbeddingUsage,
+  type EmbeddingUsageEvent,
   type OpenAIEmbeddingProviderOptions,
 } from "./embedding.js";
 export {

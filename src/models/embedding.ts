@@ -27,6 +27,24 @@ export interface EmbeddingOptions {
   readonly dimensions?: number;
 }
 
+export interface EmbeddingUsage {
+  readonly promptTokens: number;
+  readonly totalTokens: number;
+}
+
+export interface EmbeddingResult {
+  readonly embeddings: number[][];
+  readonly usage?: EmbeddingUsage;
+}
+
+export interface EmbeddingUsageEvent {
+  readonly providerId: string;
+  readonly modelId: string;
+  readonly inputCount: number;
+  readonly usage: EmbeddingUsage;
+  readonly timestamp: number;
+}
+
 /** Minimal provider contract for generating dense text embeddings. */
 export interface EmbeddingProvider {
   readonly id: string;
@@ -38,7 +56,7 @@ export interface EmbeddingProvider {
    * Hosts/vector stores can compare this to detect when an index must be rebuilt.
    */
   fingerprint(): string;
-  embed(texts: readonly string[], options?: EmbeddingOptions): Promise<number[][]>;
+  embed(texts: readonly string[], options?: EmbeddingOptions): Promise<EmbeddingResult>;
 }
 
 /** Structural subset of `Models` / `ModelHub` needed to reuse provider auth & baseUrl. */
@@ -83,6 +101,8 @@ export interface OpenAIEmbeddingProviderOptions {
   readonly maxResponseBytes?: number;
   /** Maximum accepted vector dimensionality. Defaults to `16_384`. */
   readonly maxDimensions?: number;
+  /** Optional observer invoked whenever an embedding request reports token usage. */
+  readonly onUsage?: (event: EmbeddingUsageEvent) => void;
   /** Injectable `fetch` implementation (defaults to `globalThis.fetch`). */
   readonly fetch?: typeof globalThis.fetch;
   readonly configResolver?: Omit<ConfigValueResolverOptions, "signal">;
@@ -282,8 +302,8 @@ export function createOpenAIEmbeddingProvider(options: OpenAIEmbeddingProviderOp
       const base = (fallbackBaseUrl ?? id).replace(/\/+$/, "");
       return `${base}#${options.modelId}${configuredDimensions !== undefined ? `@${configuredDimensions}` : ""}`;
     },
-    async embed(texts: readonly string[], callOptions: EmbeddingOptions = {}): Promise<number[][]> {
-      if (texts.length === 0) return [];
+    async embed(texts: readonly string[], callOptions: EmbeddingOptions = {}): Promise<EmbeddingResult> {
+      if (texts.length === 0) return { embeddings: [] };
       callOptions.signal?.throwIfAborted();
       if (!fetchImpl) {
         throw new HarnessError("INVALID_OPTIONS", "No fetch implementation available for embeddings.");
@@ -340,6 +360,25 @@ export function createOpenAIEmbeddingProvider(options: OpenAIEmbeddingProviderOp
         );
       }
 
+      const rawUsage =
+        typeof parsed === "object" &&
+        parsed !== null &&
+        typeof (parsed as { usage?: unknown }).usage === "object"
+          ? ((parsed as { usage?: Record<string, unknown> }).usage ?? undefined)
+          : undefined;
+      const promptTokens =
+        typeof rawUsage?.prompt_tokens === "number" && Number.isFinite(rawUsage.prompt_tokens)
+          ? rawUsage.prompt_tokens
+          : undefined;
+      const totalTokens =
+        typeof rawUsage?.total_tokens === "number" && Number.isFinite(rawUsage.total_tokens)
+          ? rawUsage.total_tokens
+          : promptTokens;
+      const usage: EmbeddingUsage | undefined =
+        promptTokens !== undefined || totalTokens !== undefined
+          ? { promptTokens: promptTokens ?? totalTokens ?? 0, totalTokens: totalTokens ?? promptTokens ?? 0 }
+          : undefined;
+
       const sorted = data
         .map((row, fallbackIndex) => ({
           index: typeof row.index === "number" ? row.index : fallbackIndex,
@@ -348,7 +387,7 @@ export function createOpenAIEmbeddingProvider(options: OpenAIEmbeddingProviderOp
         .sort((a, b) => a.index - b.index);
 
       let expectedDims: number | undefined;
-      return sorted.map((row, expectedIndex) => {
+      const embeddings = sorted.map((row, expectedIndex) => {
         if (row.index !== expectedIndex) {
           throw new Error(`Embedding response indices are non-contiguous at position ${expectedIndex}.`);
         }
@@ -385,6 +424,25 @@ export function createOpenAIEmbeddingProvider(options: OpenAIEmbeddingProviderOp
         }
         return nums.map((n) => n / norm);
       });
+
+      if (usage && options.onUsage) {
+        try {
+          options.onUsage({
+            providerId: id,
+            modelId: options.modelId,
+            inputCount: texts.length,
+            usage,
+            timestamp: Date.now(),
+          });
+        } catch {
+          // Usage observers must never fail embedding calls.
+        }
+      }
+
+      return {
+        embeddings,
+        ...(usage !== undefined ? { usage } : {}),
+      };
     },
   };
 }

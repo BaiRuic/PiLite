@@ -21,6 +21,7 @@ import {
   retryDelayMs,
   type SystemMessage,
   type TextContent,
+  type Usage,
 } from "@earendil-works/pi-ai";
 import {
   type CompactionCheckpoint,
@@ -57,6 +58,7 @@ import {
   type SessionStats,
   type SessionStore,
   type SessionTerminalStatus,
+  type SessionUsageEvent,
 } from "./types.js";
 
 const DEFAULT_HARNESS_IDENTITY: ClientIdentity = { attribution: null };
@@ -137,17 +139,47 @@ function generateRandomId(): string {
   );
 }
 
+function hasNonZeroUsage(usage: Usage | undefined): usage is Usage {
+  if (!usage) return false;
+  return (
+    usage.input > 0 ||
+    usage.output > 0 ||
+    usage.cacheRead > 0 ||
+    usage.cacheWrite > 0 ||
+    usage.totalTokens > 0 ||
+    usage.cost.total > 0
+  );
+}
+
 function resolveModels(source: ModelsProvider): Models {
   return typeof source === "function" ? source() : source;
 }
 
-function loadSessionExtensions(options: BaseSessionOptions): Promise<ExtensionRunner> {
+function loadSessionExtensions(
+  options: BaseSessionOptions,
+  sessionId: string,
+  now: () => number,
+): Promise<ExtensionRunner> {
   const builtinCompaction = {
     name: BUILTIN_COMPACTION_EXTENSION_NAME,
     factory: createDefaultCompactionExtension({
       getModels: () => resolveModels(options.models),
       identity: options.identity ?? DEFAULT_HARNESS_IDENTITY,
       summarizer: options.compaction?.summarizer,
+      onFailedUsage: (usage, model) => {
+        if (!options.onUsage || !hasNonZeroUsage(usage)) return;
+        try {
+          options.onUsage({
+            sessionId,
+            source: "compaction",
+            model: { provider: model.provider, modelId: model.id },
+            usage: structuredClone(usage),
+            timestamp: now(),
+          });
+        } catch {
+          // Usage observers must never interrupt error propagation.
+        }
+      },
     }),
   };
   return ExtensionRunner.load({
@@ -280,6 +312,7 @@ export class HarnessSession {
   private readonly compaction: CompactionOptions | undefined;
   private readonly identity: ClientIdentity;
   private readonly desiredSystemPrompt: string | undefined;
+  private readonly onUsage: ((event: SessionUsageEvent) => void) | undefined;
   private readonly listeners = new Set<SessionEventListener>();
 
   private committedSnapshot: SessionSnapshot;
@@ -311,6 +344,7 @@ export class HarnessSession {
     this.compaction = options.compaction;
     this.identity = options.identity ?? DEFAULT_HARNESS_IDENTITY;
     this.desiredSystemPrompt = options.systemPrompt;
+    this.onUsage = options.onUsage;
     this.committedSnapshot = structuredClone(snapshot);
     this.compactionCheckpoints = structuredClone(snapshot.compactions ?? []);
     this.customEntries = structuredClone(snapshot.customEntries ?? []);
@@ -491,6 +525,17 @@ export class HarnessSession {
       if (event.type === "agent_start" && this.activeRun?.abortRequested) {
         this.agent.abort();
       }
+      if (event.type === "message_end") {
+        if (event.message.role === "assistant") {
+          this.emitUsage("turn", event.message.usage, {
+            model: { provider: event.message.provider, modelId: event.message.model },
+          });
+        } else if (event.message.role === "toolResult") {
+          this.emitUsage("tool", event.message.usage, {
+            toolName: event.message.toolName,
+          });
+        }
+      }
       await this.extensions.emitAgentEvent(event);
       for (const listener of [...this.listeners]) {
         await listener(event, signal);
@@ -516,7 +561,7 @@ export class HarnessSession {
       throw new HarnessError("SESSION_EXISTS", `Session "${sessionId}" already exists.`);
     }
 
-    const extensions = await loadSessionExtensions(options);
+    const extensions = await loadSessionExtensions(options, sessionId, now);
 
     const timestamp = now();
     const thinkingLevel = options.thinkingLevel ?? "off";
@@ -570,7 +615,7 @@ export class HarnessSession {
     const resolvedModel = resolveModels(options.models).getModel(loaded.model.provider, loaded.model.modelId);
     const thinkingLevel = options.thinkingLevel ?? loaded.thinkingLevel ?? "off";
 
-    const extensions = await loadSessionExtensions(options);
+    const extensions = await loadSessionExtensions(options, options.sessionId, now);
 
     let snapshot = loaded;
     if (loaded.status === "running") {
@@ -705,6 +750,9 @@ export class HarnessSession {
         toolResults += 1;
         addUsage(message.usage);
       }
+    }
+    for (const checkpoint of this.committedSnapshot.compactions ?? []) {
+      addUsage(checkpoint.usage);
     }
 
     return {
@@ -841,7 +889,7 @@ export class HarnessSession {
     }
 
     const resolvedModel = this.resolvedModel;
-    const forkedExtensions = await loadSessionExtensions(this.baseOptions);
+    const forkedExtensions = await loadSessionExtensions(this.baseOptions, newSessionId, this.now);
     forkedExtensions.setActiveToolNames(this.getActiveTools());
 
     const timestamp = this.now();
@@ -1240,6 +1288,7 @@ export class HarnessSession {
       keptMessages,
       tokensBefore,
       tokensAfter: 0,
+      ...(extCompaction.usage !== undefined ? { usage: structuredClone(extCompaction.usage) } : {}),
       ...(extCompaction.details !== undefined ? { details: structuredClone(extCompaction.details) } : {}),
       timestamp,
     };
@@ -1249,6 +1298,7 @@ export class HarnessSession {
     ]);
     const tokensAfter = estimateTranscriptTokens(nextContextMessages);
     const checkpoint: CompactionCheckpoint = { ...draftCheckpoint, tokensAfter };
+    this.emitUsage("compaction", checkpoint.usage, { model: this.committedSnapshot.model });
 
     return {
       compacted: true,
@@ -1259,12 +1309,33 @@ export class HarnessSession {
         compacted: true,
         summary,
         checkpoint: structuredClone(checkpoint),
+        ...(checkpoint.usage !== undefined ? { usage: structuredClone(checkpoint.usage) } : {}),
         compactedMessages,
         keptMessages,
         tokensBefore,
         tokensAfter,
       },
     };
+  }
+
+  private emitUsage(
+    source: SessionUsageEvent["source"],
+    usage: Usage | undefined,
+    meta: { readonly model?: ModelRef; readonly toolName?: string } = {},
+  ): void {
+    if (!this.onUsage || !hasNonZeroUsage(usage)) return;
+    try {
+      this.onUsage({
+        sessionId: this.sessionId,
+        source,
+        ...(meta.model ? { model: { provider: meta.model.provider, modelId: meta.model.modelId } } : {}),
+        ...(meta.toolName !== undefined ? { toolName: meta.toolName } : {}),
+        usage: structuredClone(usage),
+        timestamp: this.now(),
+      });
+    } catch {
+      // Usage observers must never abort session execution.
+    }
   }
 
   private async finalizeStartup(reason: "create" | "open"): Promise<void> {

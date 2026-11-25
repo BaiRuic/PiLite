@@ -6,7 +6,7 @@ import type {
   AgentToolUpdateCallback,
   ToolExecutionMode,
 } from "@earendil-works/pi-agent-core";
-import type { Api, ImageContent, Model, TextContent } from "@earendil-works/pi-ai";
+import type { Api, ImageContent, Model, TextContent, Usage } from "@earendil-works/pi-ai";
 import type { Static } from "@earendil-works/pi-schema";
 import type { CompactionCheckpoint, CompactionPreparation, CompactionTrigger } from "../compaction.js";
 import type { CustomSessionEntry, SessionSnapshot } from "../types.js";
@@ -135,6 +135,8 @@ export interface SessionBeforeCompactResult {
     readonly summary: string;
     /** Optional custom cut index in `event.messages` (validated against `isSafeForkBoundary`). */
     readonly firstKeptIndex?: number;
+    /** Optional token/cost usage from the LLM call(s) that generated this summary. */
+    readonly usage?: Usage;
     /** Optional extension-specific metadata persisted on the `CompactionCheckpoint`. */
     readonly details?: unknown;
   };
