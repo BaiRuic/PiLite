@@ -1016,24 +1016,12 @@ describe("Headless Extension System", () => {
       onExtensionDiagnostic: (d) => diagnostics.push(d),
     });
 
-    // Idle call starts a run asynchronously; wait for agent_end.
-    const idleRunDone = new Promise<void>((resolve) => {
-      const unsub = session.subscribe((event) => {
-        if (event.type === "agent_end") {
-          unsub();
-          resolve();
-        }
-      });
-    });
+    // Idle call starts a run asynchronously; waitForIdle() settles once complete.
     sendFn([
       { type: "text", text: "background wake" },
       { type: "image", data: "AQID", mimeType: "image/png" },
     ]);
-    await idleRunDone;
-    // Wait a tick for commitFinalSnapshot to clear activeRun.
-    while (session.isRunning) {
-      await new Promise((r) => setTimeout(r, 5));
-    }
+    await session.waitForIdle();
 
     expect(modelUserPrompts[0]).toBe("background wake");
     expect(seenInputMeta[0]).toEqual({ text: "background wake", source: "extension" });
@@ -1097,23 +1085,49 @@ describe("Headless Extension System", () => {
       extensions: [ext],
     });
 
-    await session.prompt("initial");
+    const firstResult = await session.prompt("initial");
+    // The originating prompt() resolves immediately with Round 1's snapshot without waiting for deferred turns.
+    expect(firstResult.status).toBe("idle");
+    expect(
+      firstResult.snapshot.messages.filter((m) => m.role === "assistant").map((m) => m.content[0]),
+    ).toEqual([{ type: "text", text: "reply 1" }]);
+    expect(seenPrompts).toEqual(["initial"]);
+
+    // Deferred turns queued from agent_end / agent_settled drain asynchronously; waitForIdle() awaits them all.
+    await session.waitForIdle();
     expect(seenPrompts).toEqual(["initial", "from-agent-end", "from-agent-settled"]);
     expect(settledEvents).toEqual([
       { aborted: false, isIdle: true },
       { aborted: false, isIdle: true },
       { aborted: false, isIdle: true },
     ]);
+    expect(
+      session
+        .getSnapshot()
+        .messages.filter((m) => m.role === "assistant")
+        .map((m) => m.content[0]),
+    ).toEqual([
+      { type: "text", text: "reply 1" },
+      { type: "text", text: "reply 2" },
+      { type: "text", text: "reply 3" },
+    ]);
   });
 
-  it("aborts an active run when ctx.compact() is triggered mid-run (aligned with pi-coding-agent)", async () => {
+  it("aborts an active run when ctx.compact() is triggered mid-run and discards deferred agent_end follow-ups", async () => {
     const { faux, models, store } = createTestEnv();
     let resolveCompact!: (result: CompactionResult) => void;
     const compactPromise = new Promise<CompactionResult>((resolve) => {
       resolveCompact = resolve;
     });
+    let armAgentEndFollowUp = false;
+    let deferredRunExecuted = false;
 
     const ext: ExtensionFactory = (pi) => {
+      pi.on("agent_end", () => {
+        if (!armAgentEndFollowUp) return;
+        // Attempting to enqueue a follow-up during an aborted run must not hijack abort()/compact().
+        pi.sendUserMessage("should-not-run-after-abort");
+      });
       pi.registerTool(
         defineTool({
           name: "trigger_compact",
@@ -1133,7 +1147,10 @@ describe("Headless Extension System", () => {
     faux.setResponses([
       fauxAssistantMessage("Earlier turn answer to ensure enough history to compact."),
       fauxAssistantMessage(fauxToolCall("trigger_compact", {}, { id: "tc-cmp" }), { stopReason: "toolUse" }),
-      fauxAssistantMessage("Should not run because compact aborted the run."),
+      () => {
+        deferredRunExecuted = true;
+        return fauxAssistantMessage("Should not run because compact aborted the run.");
+      },
     ]);
 
     const session = await createSession({
@@ -1151,12 +1168,15 @@ describe("Headless Extension System", () => {
     });
 
     await session.prompt("Earlier turn question.");
+    armAgentEndFollowUp = true;
     const runResult = await session.prompt("Now trigger compact mid-run.");
     const compactResult = await compactPromise;
+    await session.waitForIdle();
 
     expect(runResult.status).toBe("aborted");
     expect(compactResult.compacted).toBe(true);
     expect(compactResult.summary).toBe("Aborted & compacted (mid-run abort compact)");
+    expect(deferredRunExecuted).toBe(false);
   });
 
   it("computes ctx.getContextUsage() from real assistant usage + trailing estimate and returns null after compaction", async () => {

@@ -369,6 +369,10 @@ export class HarnessSession {
   private isEmittingAgentEnd = false;
   private isEmittingAgentSettled = false;
   private readonly deferredSettledActions: Array<() => Promise<void>> = [];
+  private isDrainingDeferredActions = false;
+  private pendingExtensionPrompts = 0;
+  private idleWaitPromise: Promise<void> | undefined;
+  private resolveIdleWait: (() => void) | undefined;
   private invalidated = false;
   private closed = false;
   private completedTurnsInRun = 0;
@@ -1209,6 +1213,7 @@ export class HarnessSession {
    * `pi-agent-core` and final snapshot persistence have settled.
    */
   async abort(): Promise<void> {
+    this.deferredSettledActions.length = 0;
     const current = this.activeRun;
     if (!current) {
       return;
@@ -1218,6 +1223,18 @@ export class HarnessSession {
     this.agent.clearAllQueues();
     this.agent.abort();
     await current.promise.catch(() => undefined);
+  }
+
+  /** Wait until any active run and extension-triggered deferred follow-up turns have settled. */
+  async waitForIdle(): Promise<void> {
+    while (!this.isTrulyIdle()) {
+      if (!this.idleWaitPromise) {
+        this.idleWaitPromise = new Promise<void>((resolve) => {
+          this.resolveIdleWait = resolve;
+        });
+      }
+      await this.idleWaitPromise;
+    }
   }
 
   /** Notify extensions of session shutdown and persist any entries appended during shutdown. Idempotent. */
@@ -1321,24 +1338,41 @@ export class HarnessSession {
         }
         return;
       }
+      this.pendingExtensionPrompts += 1;
       return (async () => {
-        const inputResult = await this.extensions.emitInput(text, images, "extension", deliverAs);
-        if (inputResult.action === "handled") return;
-        const nextText = inputResult.action === "transform" ? inputResult.text : text;
-        const nextImages = inputResult.action === "transform" ? (inputResult.images ?? images) : images;
-        if (this.isRunning) {
-          if (deliverAs === "steer") {
-            this.steer(nextText, nextImages);
-          } else {
-            this.followUp(nextText, nextImages);
+        try {
+          const inputResult = await this.extensions.emitInput(text, images, "extension", deliverAs);
+          if (inputResult.action === "handled") return;
+          const nextText = inputResult.action === "transform" ? inputResult.text : text;
+          const nextImages = inputResult.action === "transform" ? (inputResult.images ?? images) : images;
+          if (this.isRunning) {
+            if (deliverAs === "steer") {
+              this.steer(nextText, nextImages);
+            } else {
+              this.followUp(nextText, nextImages);
+            }
+            return;
           }
-          return;
+          await this.promptWithSource(nextText, nextImages, "extension", true);
+        } finally {
+          this.pendingExtensionPrompts -= 1;
+          this.resolveIdleWaitIfIdle();
         }
-        await this.promptWithSource(nextText, nextImages, "extension", true);
       })();
     }
 
-    return this.promptWithSource(text, images, "extension").then(() => undefined);
+    this.pendingExtensionPrompts += 1;
+    return this.promptWithSource(text, images, "extension").then(
+      () => {
+        this.pendingExtensionPrompts -= 1;
+        this.resolveIdleWaitIfIdle();
+      },
+      (error) => {
+        this.pendingExtensionPrompts -= 1;
+        this.resolveIdleWaitIfIdle();
+        throw error;
+      },
+    );
   }
 
   /**
@@ -1634,6 +1668,46 @@ export class HarnessSession {
     await this.flushCustomEntriesIfChanged(entriesBefore);
   }
 
+  private isTrulyIdle(): boolean {
+    return (
+      !this.activeRun &&
+      !this.isEmittingAgentSettled &&
+      !this.isDrainingDeferredActions &&
+      this.deferredSettledActions.length === 0 &&
+      this.pendingExtensionPrompts === 0
+    );
+  }
+
+  private resolveIdleWaitIfIdle(): void {
+    if (!this.isTrulyIdle() || !this.resolveIdleWait) {
+      return;
+    }
+    const resolve = this.resolveIdleWait;
+    this.idleWaitPromise = undefined;
+    this.resolveIdleWait = undefined;
+    resolve();
+  }
+
+  private scheduleDeferredDrain(): void {
+    if (this.isDrainingDeferredActions) {
+      return;
+    }
+    this.isDrainingDeferredActions = true;
+    queueMicrotask(() => {
+      void (async () => {
+        try {
+          while (this.deferredSettledActions.length > 0 && !this.invalidated) {
+            const action = this.deferredSettledActions.shift()!;
+            await action();
+          }
+        } finally {
+          this.isDrainingDeferredActions = false;
+          this.resolveIdleWaitIfIdle();
+        }
+      })();
+    });
+  }
+
   private async emitAgentSettled(aborted: boolean): Promise<void> {
     this.isEmittingAgentSettled = true;
     const entriesBefore = this.customEntries.length;
@@ -1643,11 +1717,6 @@ export class HarnessSession {
       this.isEmittingAgentSettled = false;
     }
     await this.flushCustomEntriesIfChanged(entriesBefore);
-
-    const deferred = this.deferredSettledActions.splice(0);
-    for (const action of deferred) {
-      await action();
-    }
   }
 
   private getModels(): Models {
@@ -1725,12 +1794,21 @@ export class HarnessSession {
         }
         if (!runSucceeded || this.invalidated) {
           this.deferredSettledActions.length = 0;
+          this.resolveIdleWaitIfIdle();
         }
       }
 
       if (runSucceeded && result) {
         if (!this.invalidated) {
           await this.emitAgentSettled(result.status === "aborted");
+        }
+        if (result.status === "aborted" || this.invalidated) {
+          this.deferredSettledActions.length = 0;
+          this.resolveIdleWaitIfIdle();
+        } else if (this.deferredSettledActions.length > 0) {
+          this.scheduleDeferredDrain();
+        } else {
+          this.resolveIdleWaitIfIdle();
         }
         return result;
       }
