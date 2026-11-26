@@ -115,6 +115,24 @@ function asPositiveNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
+function asPlainObject(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function asStringRecord(value: unknown): Record<string, string> | undefined {
+  const obj = asPlainObject(value);
+  if (!obj) return undefined;
+  const out: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(obj)) {
+    if (typeof entry === "string") {
+      out[key] = entry;
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 /**
  * Default parser supporting standard OpenAI `GET /models` (`{ data: [...] }`),
  * `{ models: [...] }`, or a plain JSON array of model objects.
@@ -175,6 +193,21 @@ export function parseOpenAICompatibleModels(payload: unknown, defaults: ParsedMo
       cacheWrite: 0,
     };
 
+    const defaultCompat = asPlainObject(defaults.modelDefaults?.compat);
+    const recordCompat = asPlainObject(record.compat);
+    const mergedCompat =
+      defaultCompat || recordCompat
+        ? (structuredClone({ ...(defaultCompat ?? {}), ...(recordCompat ?? {}) }) as Model<Api>["compat"])
+        : undefined;
+    const thinkingLevelMap = asPlainObject(record.thinkingLevelMap) as Model<Api>["thinkingLevelMap"];
+    const headers = asStringRecord(record.headers);
+    const promptCache = asPlainObject(record.promptCache) as Model<Api>["promptCache"];
+    const inputLimits = asPlainObject(record.inputLimits) as Model<Api>["inputLimits"];
+    const samplingParams = asPlainObject(record.samplingParams) as Model<Api>["samplingParams"];
+    const samplingParamsByThinkingLevel = asPlainObject(
+      record.samplingParamsByThinkingLevel,
+    ) as Model<Api>["samplingParamsByThinkingLevel"];
+
     result.push({
       id,
       name,
@@ -191,7 +224,15 @@ export function parseOpenAICompatibleModels(payload: unknown, defaults: ParsedMo
         cacheRead: costRecord?.cacheRead ?? defaultCost.cacheRead,
         cacheWrite: costRecord?.cacheWrite ?? defaultCost.cacheWrite,
       },
-      ...(defaults.modelDefaults?.compat ? { compat: structuredClone(defaults.modelDefaults.compat) } : {}),
+      ...(headers ? { headers } : {}),
+      ...(thinkingLevelMap ? { thinkingLevelMap: structuredClone(thinkingLevelMap) } : {}),
+      ...(promptCache ? { promptCache: structuredClone(promptCache) } : {}),
+      ...(inputLimits ? { inputLimits: structuredClone(inputLimits) } : {}),
+      ...(samplingParams ? { samplingParams: structuredClone(samplingParams) } : {}),
+      ...(samplingParamsByThinkingLevel
+        ? { samplingParamsByThinkingLevel: structuredClone(samplingParamsByThinkingLevel) }
+        : {}),
+      ...(mergedCompat ? { compat: mergedCompat } : {}),
     });
   }
   return result;

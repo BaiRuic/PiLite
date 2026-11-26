@@ -2,6 +2,7 @@ import {
   type AuthInteraction,
   contentText,
   createProvider,
+  getSupportedThinkingLevels,
   hasApi,
   type OAuthCredential,
 } from "@earendil-works/pi-ai";
@@ -391,5 +392,62 @@ describe("ModelHub: OAuth login, custom JWT backend, local sources, and hot-swap
     hub.removeProvider("extra-faux");
     expect(hub.getModel("extra-faux", "extra-1")).toBeUndefined();
     expect(hub.getModel("corp-dynamic", "corp-model-1")).toBeDefined();
+  });
+
+  it("passes through per-model pi-ai metadata fields (compat, thinkingLevelMap, headers, promptCache, inputLimits, samplingParams)", async () => {
+    const backend = createApiBackendProvider({
+      id: "cf-gateway",
+      baseUrl: "https://gw.example.com/v1",
+      apiKey: "jwt-token",
+      modelDefaults: {
+        compat: { supportsStore: false, supportsDeveloperRole: false },
+      },
+      fetch: async () =>
+        new Response(
+          JSON.stringify({
+            data: [
+              {
+                id: "deepseek-r1",
+                api: "openai-completions",
+                baseUrl: "https://gw.example.com/deepseek/v1",
+                reasoning: true,
+                input: ["text", "image"],
+                contextWindow: 128_000,
+                maxTokens: 32_000,
+                cost: { input: 0.55, output: 2.19, cacheRead: 0.14, cacheWrite: 0 },
+                compat: { thinkingFormat: "deepseek", supportsDeveloperRole: true },
+                thinkingLevelMap: { xhigh: "xhigh", minimal: null },
+                headers: { "x-model-tier": "pro", "x-ignored-non-string": 123 },
+                promptCache: { short: { ttlSeconds: 300 } },
+                inputLimits: { images: { maxCount: 10 } },
+                samplingParams: { temperature: 0.3 },
+                samplingParamsByThinkingLevel: { high: { temperature: 0.1 } },
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+    });
+
+    const hub = createModelHub({ providers: [backend] });
+    await hub.refresh();
+
+    const model = hub.getModel("cf-gateway", "deepseek-r1");
+    expect(model).toBeDefined();
+    expect(model?.baseUrl).toBe("https://gw.example.com/deepseek/v1");
+    expect(model?.input).toEqual(["text", "image"]);
+    // Per-model compat merges over modelDefaults.compat.
+    expect(model?.compat).toEqual({
+      supportsStore: false,
+      supportsDeveloperRole: true,
+      thinkingFormat: "deepseek",
+    });
+    expect(model?.headers).toEqual({ "x-model-tier": "pro" });
+    expect(model?.thinkingLevelMap).toEqual({ xhigh: "xhigh", minimal: null });
+    expect(getSupportedThinkingLevels(model!)).toEqual(["off", "low", "medium", "high", "xhigh"]);
+    expect(model?.promptCache).toEqual({ short: { ttlSeconds: 300 } });
+    expect(model?.inputLimits).toEqual({ images: { maxCount: 10 } });
+    expect(model?.samplingParams).toEqual({ temperature: 0.3 });
+    expect(model?.samplingParamsByThinkingLevel).toEqual({ high: { temperature: 0.1 } });
   });
 });
