@@ -86,6 +86,7 @@ Source code is the single source of truth; the docs below focus strictly on arch
 - [docs/session.md](docs/session.md) — Session lifecycle, atomic commits, crash recovery, queues, retry, and compaction
 - [docs/storage.md](docs/storage.md) — `SessionStore` contract, filtered cursor pagination, and portable backends
 - [docs/models-and-extensions.md](docs/models-and-extensions.md) — Model hot-swapping, `ModelHub`, embeddings, and headless extensions
+- [docs/cloudflare-gateway-example.md](docs/cloudflare-gateway-example.md) — End-to-end example: JWT-authenticated multi-protocol passthrough gateway on Cloudflare Workers with server-side SSE usage metering
 
 ## Development & Verification
 
