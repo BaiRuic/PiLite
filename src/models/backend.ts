@@ -13,6 +13,24 @@ import {
 import { HarnessError } from "../types.js";
 import { buildApiStreamMap, STANDARD_LAZY_APIS } from "./api-streams.js";
 import { type ConfigValueResolverOptions, resolveConfigHeaders, resolveConfigValue } from "./config-value.js";
+import type { EmbeddingModel } from "./embedding.js";
+
+const PROVIDER_EMBEDDING_STATE = Symbol.for("pilite.providerEmbeddingState");
+
+export interface ProviderEmbeddingState {
+  readonly getStatic: () => readonly EmbeddingModel[];
+  /** Returns discovered embeddings from the latest network refresh, or `undefined` if not fetched in this instance. */
+  readonly getDiscovered: () => readonly EmbeddingModel[] | undefined;
+}
+
+interface ProviderWithEmbeddingState extends Provider<Api> {
+  readonly [PROVIDER_EMBEDDING_STATE]?: ProviderEmbeddingState;
+}
+
+/** Read internal static/discovered embedding catalog hooks attached to a provider. */
+export function getProviderEmbeddingState(provider: Provider<Api>): ProviderEmbeddingState | undefined {
+  return (provider as ProviderWithEmbeddingState)[PROVIDER_EMBEDDING_STATE];
+}
 
 export interface BackendAuthResult {
   readonly apiKey?: string;
@@ -70,6 +88,8 @@ export interface ApiBackendProviderOptions {
   readonly oauth?: OAuthAuth;
   /** Static baseline models (used offline before first refresh or as fallback). */
   readonly models?: readonly Model<Api>[];
+  /** Static baseline embedding models (used offline before first refresh or as fallback). */
+  readonly embeddingModels?: readonly EmbeddingModel[];
   /**
    * Relative path or absolute URL for fetching models. Defaults to `"/models"`.
    * Set to `null` to disable remote model discovery when `fetchModels` is not supplied.
@@ -81,8 +101,16 @@ export interface ApiBackendProviderOptions {
   readonly fetchModels?: (
     ctx: RefreshModelsContext & { readonly baseUrl: string; readonly headers: ProviderHeaders },
   ) => Promise<readonly Model<Api>[]>;
-  /** Custom parser for the JSON response returned by `modelsEndpoint`. */
+  /** Custom parser for the chat models in the JSON response returned by `modelsEndpoint`. */
   readonly parseModels?: (payload: unknown, defaults: ParsedModelDefaults) => readonly Model<Api>[];
+  /**
+   * Custom parser for embedding models in the JSON response returned by `modelsEndpoint`.
+   * Defaults to `parseOpenAICompatibleEmbeddingModels` (reads top-level `payload.embeddings`).
+   */
+  readonly parseEmbeddingModels?: (
+    payload: unknown,
+    defaults: { readonly providerId: string; readonly baseUrl: string },
+  ) => readonly EmbeddingModel[];
   /** Injectable `fetch` implementation (defaults to `globalThis.fetch`). */
   readonly fetch?: typeof globalThis.fetch;
   /** Resolver options for `$ENV` / optional `!command` in `apiKey` and `headers`. */
@@ -250,6 +278,66 @@ export function parseOpenAICompatibleModels(payload: unknown, defaults: ParsedMo
 }
 
 /**
+ * Default parser extracting top-level `embeddings: [...]` from an extended OpenAI `GET /models`
+ * response (`{ object: "list", data: [...chat], embeddings: [...] }`).
+ */
+export function parseOpenAICompatibleEmbeddingModels(
+  payload: unknown,
+  defaults: { readonly providerId: string; readonly baseUrl: string },
+): EmbeddingModel[] {
+  const obj = asPlainObject(payload);
+  if (!obj || !Array.isArray(obj.embeddings)) return [];
+
+  const result: EmbeddingModel[] = [];
+  for (const item of obj.embeddings) {
+    const record = asPlainObject(item);
+    if (!record) continue;
+
+    const id = typeof record.id === "string" ? record.id.trim() : "";
+    if (!id) continue;
+
+    const name = typeof record.name === "string" && record.name.trim() ? record.name.trim() : id;
+    const baseUrl =
+      typeof record.baseUrl === "string" && record.baseUrl.trim() ? record.baseUrl.trim() : defaults.baseUrl;
+    const endpoint =
+      typeof record.endpoint === "string" && record.endpoint.trim() ? record.endpoint.trim() : undefined;
+    const dimensions = asPositiveNumber(record.dimensions);
+    const supportsDimensions =
+      typeof record.supportsDimensions === "boolean" ? record.supportsDimensions : undefined;
+    const maxInputTokens =
+      asPositiveNumber(record.maxInputTokens) ??
+      asPositiveNumber(record.max_input_tokens) ??
+      asPositiveNumber(record.contextWindow) ??
+      asPositiveNumber(record.context_length);
+    const maxBatchSize = asPositiveNumber(record.maxBatchSize) ?? asPositiveNumber(record.max_batch_size);
+    const encodingFormat: "float" | null | undefined =
+      record.encodingFormat === null || record.encodingFormat === "float" ? record.encodingFormat : undefined;
+    const costObj = asPlainObject(record.cost);
+    const costInput =
+      costObj && typeof costObj.input === "number" && Number.isFinite(costObj.input) && costObj.input >= 0
+        ? costObj.input
+        : undefined;
+    const headers = asStringRecord(record.headers);
+
+    result.push({
+      id,
+      name,
+      provider: defaults.providerId,
+      baseUrl,
+      ...(endpoint !== undefined ? { endpoint } : {}),
+      ...(dimensions !== undefined ? { dimensions } : {}),
+      ...(supportsDimensions !== undefined ? { supportsDimensions } : {}),
+      ...(maxInputTokens !== undefined ? { maxInputTokens } : {}),
+      ...(maxBatchSize !== undefined ? { maxBatchSize: Math.floor(maxBatchSize) } : {}),
+      ...(encodingFormat !== undefined ? { encodingFormat } : {}),
+      ...(costInput !== undefined ? { cost: { input: costInput } } : {}),
+      ...(headers ? { headers } : {}),
+    });
+  }
+  return result;
+}
+
+/**
  * Create a `pi-ai` `Provider` backed by a custom HTTP API (JWT, rotating tokens,
  * custom headers, OpenAI/Anthropic compatible endpoints, and automatic `ModelsStore` caching).
  */
@@ -328,8 +416,12 @@ export function createApiBackendProvider(options: ApiBackendProviderOptions): Pr
 
   const discoveryEnabled = options.fetchModels !== undefined || options.modelsEndpoint !== null;
   const modelsEndpoint = options.modelsEndpoint ?? "/models";
+  const staticEmbeddings: EmbeddingModel[] = options.embeddingModels
+    ? structuredClone([...options.embeddingModels])
+    : [];
+  let discoveredEmbeddings: EmbeddingModel[] | undefined;
 
-  return createProvider<Api>({
+  const provider = createProvider<Api>({
     id: options.id,
     name: options.name ?? options.id,
     baseUrl: options.baseUrl,
@@ -428,6 +520,19 @@ export function createApiBackendProvider(options: ApiBackendProviderOptions): Pr
               );
             }
             const payload = (await response.json()) as unknown;
+            const hasEmbeddingsField =
+              typeof payload === "object" &&
+              payload !== null &&
+              Array.isArray((payload as { embeddings?: unknown }).embeddings);
+            if (options.parseEmbeddingModels || hasEmbeddingsField) {
+              const embeddingParser = options.parseEmbeddingModels ?? parseOpenAICompatibleEmbeddingModels;
+              const parsedEmbeddings = embeddingParser(payload, {
+                providerId: options.id,
+                baseUrl: effectiveBaseUrl,
+              });
+              discoveredEmbeddings = structuredClone([...parsedEmbeddings]);
+            }
+
             const parser = options.parseModels ?? parseOpenAICompatibleModels;
             return parser(payload, {
               providerId: options.id,
@@ -439,4 +544,13 @@ export function createApiBackendProvider(options: ApiBackendProviderOptions): Pr
         }
       : {}),
   });
+
+  return {
+    ...provider,
+    [PROVIDER_EMBEDDING_STATE]: {
+      getStatic: () => structuredClone(staticEmbeddings),
+      getDiscovered: () =>
+        discoveredEmbeddings !== undefined ? structuredClone(discoveredEmbeddings) : undefined,
+    },
+  } as Provider<Api>;
 }

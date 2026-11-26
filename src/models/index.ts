@@ -5,6 +5,7 @@ export {
   type BackendAuthResult,
   createApiBackendProvider,
   type ParsedModelDefaults,
+  parseOpenAICompatibleEmbeddingModels,
   parseOpenAICompatibleModels,
 } from "./backend.js";
 export {

@@ -16,8 +16,24 @@ export interface EmbeddingModel {
   readonly name: string;
   readonly provider: string;
   readonly baseUrl: string;
+  /** Optional relative path or full URL for embeddings. Defaults to `"/embeddings"`. */
+  readonly endpoint?: string;
+  /** Native or default output dimensionality (used for metadata and fingerprinting). */
   readonly dimensions?: number;
+  /**
+   * Whether the upstream endpoint supports requesting custom output dimensions (Matryoshka truncation).
+   * - `true`: `dimensions` is included in the HTTP request body.
+   * - `false`: `dimensions` is never sent in the request body; passing an explicit incompatible override throws upfront.
+   * - `undefined`: catalog `model.dimensions` is treated as informational metadata; explicit caller `dimensions` is sent.
+   */
+  readonly supportsDimensions?: boolean;
   readonly maxInputTokens?: number;
+  /** Maximum texts per HTTP request; larger arrays are automatically batched. */
+  readonly maxBatchSize?: number;
+  /** Value for `encoding_format` in request body (`"float"` by default; `null` omits the field). */
+  readonly encodingFormat?: "float" | null;
+  /** Optional input token price in USD per 1M tokens. */
+  readonly cost?: { readonly input: number };
   readonly headers?: Readonly<Record<string, string>>;
 }
 
@@ -93,6 +109,12 @@ export interface OpenAIEmbeddingProviderOptions {
   readonly headers?: Readonly<Record<string, string>>;
   /** Default output dimensions requested from the server (when supported). */
   readonly dimensions?: number;
+  /** Whether the endpoint accepts a `dimensions` request parameter (overrides `model.supportsDimensions`). */
+  readonly supportsDimensions?: boolean;
+  /** Maximum texts per HTTP request; larger inputs are automatically batched (overrides `model.maxBatchSize`). */
+  readonly maxBatchSize?: number;
+  /** Request `encoding_format` value (`"float"` by default; `null` omits the field; overrides `model.encodingFormat`). */
+  readonly encodingFormat?: "float" | null;
   /** L2-normalize returned vectors (recommended for cosine similarity). Defaults to `true`. */
   readonly normalize?: boolean;
   /** Per-request timeout in ms. Defaults to `30_000`. */
@@ -193,12 +215,37 @@ export function createOpenAIEmbeddingProvider(options: OpenAIEmbeddingProviderOp
   }
 
   const id = options.id ?? options.authFrom?.providerId ?? options.model?.provider ?? "openai-embedding";
-  const endpoint = options.endpoint ?? "/embeddings";
+  const endpoint = options.endpoint ?? options.model?.endpoint ?? "/embeddings";
   const normalize = options.normalize ?? true;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxResponseBytes = options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
   const maxDimensions = options.maxDimensions ?? DEFAULT_MAX_DIMENSIONS;
+  const supportsDimensions = options.supportsDimensions ?? options.model?.supportsDimensions;
+  const maxBatchSize = options.maxBatchSize ?? options.model?.maxBatchSize;
+  const encodingFormat =
+    options.encodingFormat !== undefined
+      ? options.encodingFormat
+      : options.model?.encodingFormat !== undefined
+        ? options.model.encodingFormat
+        : "float";
   const fetchImpl = options.fetch ?? globalThis.fetch;
+
+  if (maxBatchSize !== undefined && (!Number.isInteger(maxBatchSize) || maxBatchSize <= 0)) {
+    throw new HarnessError(
+      "INVALID_OPTIONS",
+      `Embedding provider "${id}": maxBatchSize must be a positive integer.`,
+    );
+  }
+  if (
+    supportsDimensions === false &&
+    options.dimensions !== undefined &&
+    (options.model?.dimensions === undefined || options.dimensions !== options.model.dimensions)
+  ) {
+    throw new HarnessError(
+      "INVALID_OPTIONS",
+      `Embedding model "${options.modelId}" has fixed dimensions and does not accept a custom dimensions override (${options.dimensions}).`,
+    );
+  }
 
   const fallbackBaseUrl =
     options.baseUrl ??
@@ -293,6 +340,144 @@ export function createOpenAIEmbeddingProvider(options: OpenAIEmbeddingProviderOp
 
   const configuredDimensions = options.dimensions ?? options.model?.dimensions;
 
+  const resolveRequestDimensions = (callDimensions: number | undefined): number | undefined => {
+    if (supportsDimensions === false) {
+      if (
+        callDimensions !== undefined &&
+        (options.model?.dimensions === undefined || callDimensions !== options.model.dimensions)
+      ) {
+        throw new HarnessError(
+          "INVALID_OPTIONS",
+          `Embedding model "${options.modelId}" has fixed dimensions and does not accept a custom dimensions override (${callDimensions}).`,
+        );
+      }
+      return undefined;
+    }
+    if (supportsDimensions === true) {
+      return callDimensions ?? options.dimensions ?? options.model?.dimensions;
+    }
+    // supportsDimensions omitted: send dimensions only when explicitly requested by the caller,
+    // treating catalog `model.dimensions` as informational metadata so fixed-dimension servers do not 400.
+    return callDimensions ?? options.dimensions;
+  };
+
+  const embedBatch = async (
+    batch: readonly string[],
+    url: string,
+    headers: Record<string, string>,
+    requestDimensions: number | undefined,
+    signal: AbortSignal,
+  ): Promise<{ embeddings: number[][]; usage?: EmbeddingUsage }> => {
+    const body: Record<string, unknown> = {
+      model: options.modelId,
+      input: [...batch],
+    };
+    if (encodingFormat !== null) {
+      body.encoding_format = encodingFormat;
+    }
+    if (requestDimensions !== undefined) {
+      body.dimensions = requestDimensions;
+    }
+
+    const response = await fetchImpl(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal,
+    });
+
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new Error(
+        `Embedding request to "${url}" failed for model "${options.modelId}": HTTP ${response.status}`,
+      );
+    }
+
+    const rawText = await readBoundedText(response, maxResponseBytes);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawText);
+    } catch (error) {
+      throw new Error(`Invalid JSON in embedding response from "${url}".`, { cause: error });
+    }
+
+    const data =
+      typeof parsed === "object" && parsed !== null && Array.isArray((parsed as { data?: unknown }).data)
+        ? ((parsed as { data: unknown[] }).data as Array<{ index?: unknown; embedding?: unknown }>)
+        : undefined;
+    if (!data || data.length !== batch.length) {
+      throw new Error(
+        `Embedding response from "${url}" returned ${data?.length ?? 0} vectors for ${batch.length} inputs.`,
+      );
+    }
+
+    const rawUsage =
+      typeof parsed === "object" &&
+      parsed !== null &&
+      typeof (parsed as { usage?: unknown }).usage === "object"
+        ? ((parsed as { usage?: Record<string, unknown> }).usage ?? undefined)
+        : undefined;
+    const promptTokens =
+      typeof rawUsage?.prompt_tokens === "number" && Number.isFinite(rawUsage.prompt_tokens)
+        ? rawUsage.prompt_tokens
+        : undefined;
+    const totalTokens =
+      typeof rawUsage?.total_tokens === "number" && Number.isFinite(rawUsage.total_tokens)
+        ? rawUsage.total_tokens
+        : promptTokens;
+    const usage: EmbeddingUsage | undefined =
+      promptTokens !== undefined || totalTokens !== undefined
+        ? { promptTokens: promptTokens ?? totalTokens ?? 0, totalTokens: totalTokens ?? promptTokens ?? 0 }
+        : undefined;
+
+    const sorted = data
+      .map((row, fallbackIndex) => ({
+        index: typeof row.index === "number" ? row.index : fallbackIndex,
+        embedding: row.embedding,
+      }))
+      .sort((a, b) => a.index - b.index);
+
+    let expectedDims: number | undefined;
+    const embeddings = sorted.map((row, expectedIndex) => {
+      if (row.index !== expectedIndex) {
+        throw new Error(`Embedding response indices are non-contiguous at position ${expectedIndex}.`);
+      }
+      if (!Array.isArray(row.embedding) || row.embedding.length === 0) {
+        throw new Error(`Embedding vector at index ${expectedIndex} is empty or invalid.`);
+      }
+      if (row.embedding.length > maxDimensions) {
+        throw new Error(`Embedding vector dimension ${row.embedding.length} exceeds limit ${maxDimensions}.`);
+      }
+      if (expectedDims === undefined) {
+        expectedDims = row.embedding.length;
+      } else if (row.embedding.length !== expectedDims) {
+        throw new Error(
+          `Inconsistent embedding dimensions: expected ${expectedDims}, got ${row.embedding.length}.`,
+        );
+      }
+      const vector = row.embedding as unknown[];
+      for (let i = 0; i < vector.length; i += 1) {
+        if (typeof vector[i] !== "number" || !Number.isFinite(vector[i])) {
+          throw new Error(`Embedding vector at index ${expectedIndex} contains a non-finite number.`);
+        }
+      }
+      const nums = vector as number[];
+      if (!normalize) {
+        return nums.slice();
+      }
+      const norm = Math.hypot(...nums);
+      if (!norm || !Number.isFinite(norm)) {
+        throw new Error(`Embedding vector at index ${expectedIndex} has zero norm and cannot be normalized.`);
+      }
+      return nums.map((n) => n / norm);
+    });
+
+    return {
+      embeddings,
+      ...(usage !== undefined ? { usage } : {}),
+    };
+  };
+
   return {
     id,
     modelId: options.modelId,
@@ -309,6 +494,7 @@ export function createOpenAIEmbeddingProvider(options: OpenAIEmbeddingProviderOp
         throw new HarnessError("INVALID_OPTIONS", "No fetch implementation available for embeddings.");
       }
 
+      const requestDimensions = resolveRequestDimensions(callOptions.dimensions);
       const timeoutSignal = timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : undefined;
       const effectiveSignal =
         callOptions.signal && timeoutSignal
@@ -317,113 +503,38 @@ export function createOpenAIEmbeddingProvider(options: OpenAIEmbeddingProviderOp
 
       const { baseUrl, headers } = await resolveRequestParams(effectiveSignal);
       const url = joinUrl(baseUrl, endpoint);
-      const requestedDimensions = callOptions.dimensions ?? configuredDimensions;
 
-      const body: Record<string, unknown> = {
-        model: options.modelId,
-        input: [...texts],
-        encoding_format: "float",
-      };
-      if (requestedDimensions !== undefined) {
-        body.dimensions = requestedDimensions;
-      }
+      const batchSize = maxBatchSize ?? texts.length;
+      const allEmbeddings: number[][] = [];
+      let expectedDimsAcrossBatches: number | undefined;
+      let totalPromptTokens = 0;
+      let totalAllTokens = 0;
+      let sawUsage = false;
 
-      const response = await fetchImpl(url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
-        signal: effectiveSignal,
-      });
-
-      if (!response.ok) {
-        await response.body?.cancel().catch(() => undefined);
-        throw new Error(
-          `Embedding request to "${url}" failed for model "${options.modelId}": HTTP ${response.status}`,
-        );
-      }
-
-      const rawText = await readBoundedText(response, maxResponseBytes);
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(rawText);
-      } catch (error) {
-        throw new Error(`Invalid JSON in embedding response from "${url}".`, { cause: error });
-      }
-
-      const data =
-        typeof parsed === "object" && parsed !== null && Array.isArray((parsed as { data?: unknown }).data)
-          ? ((parsed as { data: unknown[] }).data as Array<{ index?: unknown; embedding?: unknown }>)
-          : undefined;
-      if (!data || data.length !== texts.length) {
-        throw new Error(
-          `Embedding response from "${url}" returned ${data?.length ?? 0} vectors for ${texts.length} inputs.`,
-        );
-      }
-
-      const rawUsage =
-        typeof parsed === "object" &&
-        parsed !== null &&
-        typeof (parsed as { usage?: unknown }).usage === "object"
-          ? ((parsed as { usage?: Record<string, unknown> }).usage ?? undefined)
-          : undefined;
-      const promptTokens =
-        typeof rawUsage?.prompt_tokens === "number" && Number.isFinite(rawUsage.prompt_tokens)
-          ? rawUsage.prompt_tokens
-          : undefined;
-      const totalTokens =
-        typeof rawUsage?.total_tokens === "number" && Number.isFinite(rawUsage.total_tokens)
-          ? rawUsage.total_tokens
-          : promptTokens;
-      const usage: EmbeddingUsage | undefined =
-        promptTokens !== undefined || totalTokens !== undefined
-          ? { promptTokens: promptTokens ?? totalTokens ?? 0, totalTokens: totalTokens ?? promptTokens ?? 0 }
-          : undefined;
-
-      const sorted = data
-        .map((row, fallbackIndex) => ({
-          index: typeof row.index === "number" ? row.index : fallbackIndex,
-          embedding: row.embedding,
-        }))
-        .sort((a, b) => a.index - b.index);
-
-      let expectedDims: number | undefined;
-      const embeddings = sorted.map((row, expectedIndex) => {
-        if (row.index !== expectedIndex) {
-          throw new Error(`Embedding response indices are non-contiguous at position ${expectedIndex}.`);
-        }
-        if (!Array.isArray(row.embedding) || row.embedding.length === 0) {
-          throw new Error(`Embedding vector at index ${expectedIndex} is empty or invalid.`);
-        }
-        if (row.embedding.length > maxDimensions) {
-          throw new Error(
-            `Embedding vector dimension ${row.embedding.length} exceeds limit ${maxDimensions}.`,
-          );
-        }
-        if (expectedDims === undefined) {
-          expectedDims = row.embedding.length;
-        } else if (row.embedding.length !== expectedDims) {
-          throw new Error(
-            `Inconsistent embedding dimensions: expected ${expectedDims}, got ${row.embedding.length}.`,
-          );
-        }
-        const vector = row.embedding as unknown[];
-        for (let i = 0; i < vector.length; i += 1) {
-          if (typeof vector[i] !== "number" || !Number.isFinite(vector[i])) {
-            throw new Error(`Embedding vector at index ${expectedIndex} contains a non-finite number.`);
+      for (let offset = 0; offset < texts.length; offset += batchSize) {
+        effectiveSignal.throwIfAborted();
+        const slice = texts.slice(offset, offset + batchSize);
+        const batchResult = await embedBatch(slice, url, headers, requestDimensions, effectiveSignal);
+        for (const vector of batchResult.embeddings) {
+          if (expectedDimsAcrossBatches === undefined) {
+            expectedDimsAcrossBatches = vector.length;
+          } else if (vector.length !== expectedDimsAcrossBatches) {
+            throw new Error(
+              `Inconsistent embedding dimensions across batches: expected ${expectedDimsAcrossBatches}, got ${vector.length}.`,
+            );
           }
+          allEmbeddings.push(vector);
         }
-        const nums = vector as number[];
-        if (!normalize) {
-          return nums.slice();
+        if (batchResult.usage) {
+          sawUsage = true;
+          totalPromptTokens += batchResult.usage.promptTokens;
+          totalAllTokens += batchResult.usage.totalTokens;
         }
-        const norm = Math.hypot(...nums);
-        if (!norm || !Number.isFinite(norm)) {
-          throw new Error(
-            `Embedding vector at index ${expectedIndex} has zero norm and cannot be normalized.`,
-          );
-        }
-        return nums.map((n) => n / norm);
-      });
+      }
+
+      const usage: EmbeddingUsage | undefined = sawUsage
+        ? { promptTokens: totalPromptTokens, totalTokens: totalAllTokens }
+        : undefined;
 
       if (usage && options.onUsage) {
         try {
@@ -440,7 +551,7 @@ export function createOpenAIEmbeddingProvider(options: OpenAIEmbeddingProviderOp
       }
 
       return {
-        embeddings,
+        embeddings: allEmbeddings,
         ...(usage !== undefined ? { usage } : {}),
       };
     },

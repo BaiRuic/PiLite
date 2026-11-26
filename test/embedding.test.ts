@@ -7,6 +7,8 @@ import {
   createStaticLocalModelSource,
   type EmbeddingUsageEvent,
 } from "../src/models/index.js";
+import { createSqliteModelsStore } from "../src/models/sqlite/index.js";
+import { openNodeSqliteDatabase } from "../src/store/sqlite/node.js";
 
 describe("createOpenAIEmbeddingProvider (standalone)", () => {
   it("calls POST /embeddings, sorts by index, L2-normalizes by default, reports usage, and computes stable fingerprints", async () => {
@@ -240,5 +242,262 @@ describe("ModelHub embedding model discovery, selection, and auth reuse", () => 
 
     // Unknown provider with no baseUrl rejects with MODEL_NOT_FOUND.
     expect(() => hub.createEmbeddingProvider("nope", "missing")).toThrow(HarnessError);
+  });
+
+  it("enforces fixed vs variable dimensions, supports maxBatchSize chunking, encodingFormat: null, and custom endpoint", async () => {
+    const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const usageEvents: EmbeddingUsageEvent[] = [];
+    const mockFetch: typeof globalThis.fetch = async (input, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+      requests.push({ url: String(input), body });
+      const inputs = body.input as string[];
+      return new Response(
+        JSON.stringify({
+          data: inputs.map((_, idx) => ({ index: idx, embedding: [3, 4] })),
+          usage: { prompt_tokens: inputs.length * 10, total_tokens: inputs.length * 10 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+
+    // 1. Fixed-dimension model: never sends dimensions in request body; incompatible override throws upfront.
+    const fixedModel = {
+      id: "nomic-embed-text",
+      name: "Nomic Embed",
+      provider: "ollama",
+      baseUrl: "http://127.0.0.1:11434/v1",
+      endpoint: "/custom-embed",
+      dimensions: 768,
+      supportsDimensions: false,
+      maxBatchSize: 2,
+      encodingFormat: null as null,
+    };
+
+    expect(() =>
+      createOpenAIEmbeddingProvider({
+        modelId: fixedModel.id,
+        model: fixedModel,
+        allowKeyless: true,
+        dimensions: 512,
+        fetch: mockFetch,
+      }),
+    ).toThrow(HarnessError);
+
+    const fixedEmbedder = createOpenAIEmbeddingProvider({
+      modelId: fixedModel.id,
+      model: fixedModel,
+      allowKeyless: true,
+      onUsage: (e) => usageEvents.push(e),
+      fetch: mockFetch,
+    });
+
+    await expect(fixedEmbedder.embed(["a"], { dimensions: 512 })).rejects.toThrow(HarnessError);
+    expect(requests).toHaveLength(0);
+
+    // 5 inputs with maxBatchSize=2 -> 3 sequential batches (2, 2, 1), aggregated usage, no encoding_format or dimensions.
+    const batched = await fixedEmbedder.embed(["t1", "t2", "t3", "t4", "t5"]);
+    expect(batched.embeddings).toHaveLength(5);
+    expect(batched.usage).toEqual({ promptTokens: 50, totalTokens: 50 });
+    expect(usageEvents).toHaveLength(1);
+    expect(usageEvents[0]?.inputCount).toBe(5);
+    expect(requests).toEqual([
+      {
+        url: "http://127.0.0.1:11434/v1/custom-embed",
+        body: { model: "nomic-embed-text", input: ["t1", "t2"] },
+      },
+      {
+        url: "http://127.0.0.1:11434/v1/custom-embed",
+        body: { model: "nomic-embed-text", input: ["t3", "t4"] },
+      },
+      { url: "http://127.0.0.1:11434/v1/custom-embed", body: { model: "nomic-embed-text", input: ["t5"] } },
+    ]);
+
+    // 2. Variable-dimension model (supportsDimensions: true): sends configured/overridden dimensions.
+    requests.length = 0;
+    const varEmbedder = createOpenAIEmbeddingProvider({
+      modelId: "text-embedding-3-small",
+      model: {
+        id: "text-embedding-3-small",
+        name: "OpenAI Embedding 3 Small",
+        provider: "gw",
+        baseUrl: "https://gw.example.com/openai/v1",
+        dimensions: 1536,
+        supportsDimensions: true,
+      },
+      allowKeyless: true,
+      fetch: mockFetch,
+    });
+    await varEmbedder.embed(["a"]);
+    await varEmbedder.embed(["b"], { dimensions: 512 });
+    expect(requests[0]?.body).toEqual({
+      model: "text-embedding-3-small",
+      input: ["a"],
+      encoding_format: "float",
+      dimensions: 1536,
+    });
+    expect(requests[1]?.body).toEqual({
+      model: "text-embedding-3-small",
+      input: ["b"],
+      encoding_format: "float",
+      dimensions: 512,
+    });
+  });
+
+  it("discovers top-level embeddings from GET /models, persists them offline in SqliteModelsStore, and coexists with local Ollama embeddings", async () => {
+    const db = await openNodeSqliteDatabase(":memory:");
+    try {
+      let catalogFetchCount = 0;
+      const seenRequests: Array<{
+        url: string;
+        headers: Record<string, string>;
+        body?: Record<string, unknown>;
+      }> = [];
+
+      const mockFetch: typeof globalThis.fetch = async (input, init) => {
+        const url = String(input);
+        const headers = (init?.headers ?? {}) as Record<string, string>;
+        const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : undefined;
+        seenRequests.push({ url, headers, body });
+
+        if (url === "https://gw.example.com/v1/models") {
+          catalogFetchCount += 1;
+          return new Response(
+            JSON.stringify({
+              object: "list",
+              data: [
+                {
+                  id: "claude-sonnet-4-5",
+                  type: "model", // Ensure standard non-"chat" upstream type values are never dropped.
+                  api: "anthropic-messages",
+                  baseUrl: "https://gw.example.com/anthropic",
+                },
+              ],
+              embeddings: [
+                {
+                  id: "text-embedding-3-small",
+                  name: "OpenAI Embedding 3 Small",
+                  baseUrl: "https://gw.example.com/openai/v1",
+                  dimensions: 1536,
+                  supportsDimensions: true,
+                  maxInputTokens: 8191,
+                  maxBatchSize: 2048,
+                  cost: { input: 0.02 },
+                },
+              ],
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+
+        if (url.endsWith("/embeddings")) {
+          return new Response(
+            JSON.stringify({
+              data: [{ index: 0, embedding: [3, 4] }],
+              usage: { prompt_tokens: 4, total_tokens: 4 },
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+
+        return new Response("Not Found", { status: 404 });
+      };
+
+      const makeGateway = () =>
+        createApiBackendProvider({
+          id: "my-gateway",
+          baseUrl: "https://gw.example.com/v1",
+          getAuth: async () => ({
+            apiKey: "jwt-1",
+            headers: { "x-gateway-token": "jwt-1" },
+          }),
+          fetch: mockFetch,
+        });
+
+      const localOllama = createStaticLocalModelSource({
+        providers: {
+          "ollama-local": {
+            baseUrl: "http://127.0.0.1:11434/v1",
+            embeddingModels: [
+              {
+                id: "nomic-embed-text",
+                name: "Nomic Embed Text",
+                dimensions: 768,
+                supportsDimensions: false,
+                maxInputTokens: 8192,
+                maxBatchSize: 32,
+                encodingFormat: null,
+              },
+            ],
+          },
+        },
+      });
+
+      const hub1 = createModelHub({
+        modelsStore: createSqliteModelsStore(db),
+        providers: [makeGateway()],
+        localSources: [localOllama],
+        fetch: mockFetch,
+      });
+
+      await hub1.init({ allowNetwork: true });
+      expect(catalogFetchCount).toBe(1);
+      expect(hub1.getModels("my-gateway").map((m) => m.id)).toEqual(["claude-sonnet-4-5"]);
+
+      const available1 = await hub1.getAvailableEmbeddingModels();
+      expect(available1.map((m) => `${m.provider}/${m.id}`).sort()).toEqual([
+        "my-gateway/text-embedding-3-small",
+        "ollama-local/nomic-embed-text",
+      ]);
+
+      // Call remote gateway embedding & local Ollama embedding.
+      await hub1.createEmbeddingProvider("my-gateway", "text-embedding-3-small").embed(["hello"]);
+      await hub1.createEmbeddingProvider("ollama-local", "nomic-embed-text").embed(["world"]);
+
+      const gwEmbedReq = seenRequests.find((r) => r.url === "https://gw.example.com/openai/v1/embeddings");
+      expect(gwEmbedReq?.headers["x-gateway-token"]).toBe("jwt-1");
+      expect(gwEmbedReq?.body).toEqual({
+        model: "text-embedding-3-small",
+        input: ["hello"],
+        encoding_format: "float",
+        dimensions: 1536,
+      });
+
+      const ollamaEmbedReq = seenRequests.find((r) => r.url === "http://127.0.0.1:11434/v1/embeddings");
+      expect(ollamaEmbedReq?.headers.authorization).toBeUndefined();
+      expect(ollamaEmbedReq?.body).toEqual({
+        model: "nomic-embed-text",
+        input: ["world"],
+      });
+
+      // Simulate restart completely offline: fresh ModelHub restores remote embeddings from SqliteModelsStore!
+      const hub2 = createModelHub({
+        modelsStore: createSqliteModelsStore(db),
+        providers: [makeGateway()],
+        localSources: [localOllama],
+        fetch: mockFetch,
+      });
+      await hub2.init({ allowNetwork: false });
+      expect(catalogFetchCount).toBe(1); // Zero network requests!
+
+      expect(hub2.getModels("my-gateway").map((m) => m.id)).toEqual(["claude-sonnet-4-5"]);
+      const restored = hub2.getEmbeddingModel("my-gateway", "text-embedding-3-small");
+      expect(restored).toEqual({
+        id: "text-embedding-3-small",
+        name: "OpenAI Embedding 3 Small",
+        provider: "my-gateway",
+        baseUrl: "https://gw.example.com/openai/v1",
+        dimensions: 1536,
+        supportsDimensions: true,
+        maxInputTokens: 8191,
+        maxBatchSize: 2048,
+        cost: { input: 0.02 },
+      });
+      expect((await hub2.getAvailableEmbeddingModels()).map((m) => `${m.provider}/${m.id}`).sort()).toEqual([
+        "my-gateway/text-embedding-3-small",
+        "ollama-local/nomic-embed-text",
+      ]);
+    } finally {
+      await db.close();
+    }
   });
 });

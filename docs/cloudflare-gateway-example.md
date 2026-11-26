@@ -178,11 +178,25 @@ PiLite's default parser `parseOpenAICompatibleModels()` accepts `{ data: [...] }
         "requiresReasoningContentOnAssistantMessages": true
       }
     }
+  ],
+  "embeddings": [
+    {
+      "id": "text-embedding-3-small",
+      "name": "OpenAI Embedding 3 Small",
+      "baseUrl": "https://gw.example.com/openai/v1",
+      "dimensions": 1536,
+      "supportsDimensions": true,
+      "maxInputTokens": 8191,
+      "maxBatchSize": 2048,
+      "cost": { "input": 0.02 }
+    }
   ]
 }
 ```
 
-### Supported Catalog Fields (`parseOpenAICompatibleModels`)
+> Keeping embedding models in a dedicated top-level `embeddings` array keeps `data` 100% pure chat models (compatible with standard OpenAI clients and never colliding with upstream `type: "model"` fields) while still returning everything in a single `GET /v1/models` request.
+
+### Supported Catalog Fields (`parseOpenAICompatibleModels` & `parseOpenAICompatibleEmbeddingModels`)
 
 | Field | Required | Purpose in PiLite / `pi-ai` |
 | --- | --- | --- |
@@ -315,23 +329,17 @@ await session.setModel({ provider: "my-gateway", modelId: "gemini-2.5-pro" });
 await session.prompt("Review the interface for edge cases.");
 ```
 
-### Optional: Reusing Gateway Auth for Embeddings
+### Optional: Auto-Discovered Embeddings (With Offline Cache) on the Same Gateway
 
-If your gateway also exposes `POST /openai/v1/embeddings`, PiLite's `EmbeddingProvider` reuses the exact same `getAuth()` JWT automatically:
+You do **not** need a separate catalog endpoint for embedding models. Return a top-level `embeddings: [...]` array alongside `data` in `GET /v1/models` and route `POST /openai/v1/embeddings` through the existing `/openai` prefix. After `hub.refresh()`, PiLite discovers them automatically, caches them offline in `modelsStore`, and reuses the exact same `getAuth()` JWT (while coexisting cleanly with any local Ollama / custom embedding models in `localSources`):
 
 ```ts
-hub.registerEmbeddingModels([
-  {
-    id: "text-embedding-3-small",
-    name: "OpenAI Embedding 3 Small",
-    provider: "my-gateway",
-    baseUrl: "https://gw.example.com/openai/v1",
-    dimensions: 1536,
-  },
-]);
+// Automatically populated from GET /v1/models `embeddings` (and restored offline from modelsStore)
+const embeddingModels = await hub.getAvailableEmbeddingModels("my-gateway");
+console.log("Embedding models:", embeddingModels.map((m) => m.id));
 
 const embedder = hub.createEmbeddingProvider("my-gateway", "text-embedding-3-small");
-const { embeddings } = await embedder.embed(["hello world"]);
+const { embeddings, usage } = await embedder.embed(["hello world"]);
 ```
 
 ---
@@ -409,6 +417,23 @@ interface GatewayModelEntry {
   compat?: Record<string, unknown>;
   thinkingLevelMap?: Record<string, string | null>;
   promptCache?: { short?: number; long?: number };
+}
+
+interface GatewayEmbeddingEntry {
+  id: string;
+  name: string;
+  routePrefix: string; // e.g. "/openai/v1"
+  dimensions?: number;
+  supportsDimensions?: boolean;
+  maxInputTokens?: number;
+  maxBatchSize?: number;
+  encodingFormat?: "float" | null;
+  cost: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+  };
 }
 
 interface RouteConfig {
@@ -498,6 +523,19 @@ const CATALOG: readonly GatewayModelEntry[] = [
   },
 ];
 
+const EMBEDDING_CATALOG: readonly GatewayEmbeddingEntry[] = [
+  {
+    id: "text-embedding-3-small",
+    name: "OpenAI Embedding 3 Small",
+    routePrefix: "/openai/v1",
+    dimensions: 1536,
+    supportsDimensions: true,
+    maxInputTokens: 8191,
+    maxBatchSize: 2048,
+    cost: { input: 0.02, output: 0, cacheRead: 0, cacheWrite: 0 },
+  },
+];
+
 const ROUTES: readonly RouteConfig[] = [
   {
     prefix: "/anthropic",
@@ -583,7 +621,12 @@ export default {
         ...model,
         baseUrl: `${origin}${routePrefix}`,
       }));
-      return new Response(JSON.stringify({ object: "list", data }), {
+      const embeddings = EMBEDDING_CATALOG.map(({ routePrefix, cost, ...model }) => ({
+        ...model,
+        baseUrl: `${origin}${routePrefix}`,
+        cost: { input: cost.input },
+      }));
+      return new Response(JSON.stringify({ object: "list", data, embeddings }), {
         status: 200,
         headers: { ...cors, "content-type": "application/json", "cache-control": "private, max-age=60" },
       });
@@ -637,9 +680,12 @@ export default {
       }
     }
 
-    // Enforce catalog allowlist (skip for non-chat endpoints like /embeddings if you expose them).
+    // Enforce catalog allowlist (separating chat models from /embeddings models).
+    const isEmbeddingEndpoint = upstreamPath.includes("/embeddings");
     const catalogEntry = requestedModelId
-      ? CATALOG.find((m) => m.id === requestedModelId && m.routePrefix.startsWith(route.prefix))
+      ? (isEmbeddingEndpoint ? EMBEDDING_CATALOG : CATALOG).find(
+          (m) => m.id === requestedModelId && m.routePrefix.startsWith(route.prefix),
+        )
       : undefined;
 
     if (!catalogEntry) {
@@ -712,6 +758,7 @@ export default {
 // ---------------------------------------------------------------------------
 
 function detectWireApi(route: RouteConfig, upstreamPath: string): WireApi {
+  if (upstreamPath.includes("/embeddings")) return "openai-completions";
   if (route.prefix === "/openai") {
     if (upstreamPath.includes("/chat/completions")) return "openai-completions";
     return "openai-responses";
@@ -730,7 +777,7 @@ async function meterAndRecordUsage(params: {
   isEventStream: boolean;
   api: WireApi;
   userId: string;
-  model: GatewayModelEntry;
+  model: Pick<GatewayModelEntry, "id" | "cost">;
   env: Env;
 }): Promise<void> {
   try {

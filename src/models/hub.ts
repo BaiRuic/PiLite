@@ -22,6 +22,7 @@ import {
   type ProviderStreams,
 } from "@earendil-works/pi-ai";
 import { HarnessError, type ModelsProvider } from "../types.js";
+import { getProviderEmbeddingState } from "./backend.js";
 import type { ConfigValueResolverOptions } from "./config-value.js";
 import {
   createOpenAIEmbeddingProvider,
@@ -71,6 +72,24 @@ export interface LoginProviderInfo {
   readonly oauthLabel?: string;
 }
 
+const EMBEDDING_CACHE_KEY_PREFIX = "__pilite_embeddings__:";
+
+function embeddingCacheKey(providerId: string): string {
+  return `${EMBEDDING_CACHE_KEY_PREFIX}${providerId}`;
+}
+
+function isStoredEmbeddingModel(value: unknown): value is EmbeddingModel {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.id === "string" &&
+    record.id.length > 0 &&
+    typeof record.name === "string" &&
+    typeof record.provider === "string" &&
+    typeof record.baseUrl === "string"
+  );
+}
+
 /**
  * Unified model registry hub combining:
  * 1. Built-in OAuth/API providers (`pi-ai`),
@@ -85,6 +104,7 @@ export class ModelHub {
   private readonly identity?: ClientIdentity;
   private readonly baseProviders = new Map<string, Provider<Api>>();
   private readonly registeredEmbeddingModels = new Map<string, EmbeddingModel>();
+  private readonly cachedRemoteEmbeddingModels = new Map<string, EmbeddingModel[]>();
   private readonly localSources: LocalModelSource[];
   private readonly configResolver?: Omit<ConfigValueResolverOptions, "signal">;
   private readonly fetchImpl?: typeof globalThis.fetch;
@@ -146,17 +166,30 @@ export class ModelHub {
     }
     this.localConfig = mergeLocalModelsConfigs(loaded);
     const next = this.buildModelsInstance();
+    const allowNetwork = options.allowNetwork ?? false;
     const result = await next.refresh({
-      allowNetwork: options.allowNetwork ?? false,
+      allowNetwork,
       ...(options.signal ? { signal: options.signal } : {}),
+    });
+    await this.syncProviderEmbeddingCaches(next, {
+      allowNetwork,
+      errors: result.errors,
+      signal: options.signal,
     });
     this.activeModels = next;
     return result;
   }
 
   /** Refresh dynamic providers (custom backends, `discover: true` local servers, OAuth catalogs). */
-  refresh(options: ModelsRefreshOptions = {}): Promise<ModelsRefreshResult> {
-    return this.activeModels.refresh(options);
+  async refresh(options: ModelsRefreshOptions = {}): Promise<ModelsRefreshResult> {
+    const result = await this.activeModels.refresh(options);
+    await this.syncProviderEmbeddingCaches(this.activeModels, {
+      allowNetwork: options.allowNetwork ?? true,
+      providers: options.providers,
+      errors: result.errors,
+      signal: options.signal,
+    });
+    return result;
   }
 
   /** Run interactive OAuth or API-key login for a registered provider and persist credentials. */
@@ -191,6 +224,7 @@ export class ModelHub {
       this.activeModels.setProvider(composed);
     } else {
       this.activeModels.deleteProvider(providerId);
+      this.cachedRemoteEmbeddingModels.delete(providerId);
     }
   }
 
@@ -247,12 +281,21 @@ export class ModelHub {
     this.registerEmbeddingModels(models);
   }
 
-  /** List all known embedding models (combining programmatic registrations and `localSources`). */
+  /** List all known embedding models (combining remote discovered/cached models, `localSources`, and programmatic registrations). */
   getEmbeddingModels(providerId?: string): EmbeddingModel[] {
     const merged = new Map<string, EmbeddingModel>();
-    for (const [key, model] of this.registeredEmbeddingModels) {
-      if (providerId !== undefined && model.provider !== providerId) continue;
-      merged.set(key, structuredClone(model));
+
+    for (const provider of this.activeModels.getProviders()) {
+      if (providerId !== undefined && provider.id !== providerId) continue;
+      const state = getProviderEmbeddingState(provider);
+      const fromProvider =
+        state?.getDiscovered() ??
+        this.cachedRemoteEmbeddingModels.get(provider.id) ??
+        state?.getStatic() ??
+        [];
+      for (const model of fromProvider) {
+        merged.set(`${model.provider}\0${model.id}`, structuredClone(model));
+      }
     }
 
     for (const [pid, cfg] of Object.entries(this.localConfig.providers)) {
@@ -267,11 +310,21 @@ export class ModelHub {
           name: def.name ?? def.id,
           provider: pid,
           baseUrl,
+          ...(def.endpoint !== undefined ? { endpoint: def.endpoint } : {}),
           ...(def.dimensions !== undefined ? { dimensions: def.dimensions } : {}),
+          ...(def.supportsDimensions !== undefined ? { supportsDimensions: def.supportsDimensions } : {}),
           ...(def.maxInputTokens !== undefined ? { maxInputTokens: def.maxInputTokens } : {}),
+          ...(def.maxBatchSize !== undefined ? { maxBatchSize: def.maxBatchSize } : {}),
+          ...(def.encodingFormat !== undefined ? { encodingFormat: def.encodingFormat } : {}),
+          ...(def.cost !== undefined ? { cost: { input: def.cost.input } } : {}),
           ...(def.headers ? { headers: { ...def.headers } } : {}),
         });
       }
+    }
+
+    for (const [key, model] of this.registeredEmbeddingModels) {
+      if (providerId !== undefined && model.provider !== providerId) continue;
+      merged.set(key, structuredClone(model));
     }
 
     return [...merged.values()];
@@ -344,6 +397,60 @@ export class ModelHub {
       });
     }
     return result;
+  }
+
+  private async syncProviderEmbeddingCaches(
+    models: Models,
+    options: {
+      readonly allowNetwork: boolean;
+      readonly providers?: readonly string[];
+      readonly errors: ReadonlyMap<string, Error>;
+      readonly signal?: AbortSignal;
+    },
+  ): Promise<void> {
+    const filter = options.providers ? new Set(options.providers) : undefined;
+    for (const provider of models.getProviders()) {
+      if (filter && !filter.has(provider.id)) continue;
+      options.signal?.throwIfAborted();
+      const state = getProviderEmbeddingState(provider);
+      if (!state) continue;
+
+      const discovered = state.getDiscovered();
+      if (options.allowNetwork && !options.errors.has(provider.id) && discovered !== undefined) {
+        const cloned = structuredClone([...discovered]);
+        this.cachedRemoteEmbeddingModels.set(provider.id, cloned);
+        if (this.modelsStore) {
+          try {
+            await this.modelsStore.write(
+              embeddingCacheKey(provider.id),
+              {
+                models: cloned as unknown as readonly AnyModel[],
+                checkedAt: Date.now(),
+              },
+              options.signal ? { signal: options.signal } : undefined,
+            );
+          } catch {
+            // Embedding catalog cache persistence is best-effort and must not fail refresh().
+          }
+        }
+        continue;
+      }
+
+      if (this.modelsStore && !this.cachedRemoteEmbeddingModels.has(provider.id)) {
+        try {
+          const stored = await this.modelsStore.read(
+            embeddingCacheKey(provider.id),
+            options.signal ? { signal: options.signal } : undefined,
+          );
+          if (stored && Array.isArray(stored.models)) {
+            const restored = stored.models.filter(isStoredEmbeddingModel).map((m) => structuredClone(m));
+            this.cachedRemoteEmbeddingModels.set(provider.id, restored);
+          }
+        } catch {
+          // Ignore corrupt/unreadable cache entries on startup.
+        }
+      }
+    }
   }
 
   private composeProvider(providerId: string): Provider<Api> | undefined {

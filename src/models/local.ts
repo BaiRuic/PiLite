@@ -40,8 +40,13 @@ export interface LocalEmbeddingModelDefinition {
   readonly id: string;
   readonly name?: string;
   readonly baseUrl?: string;
+  readonly endpoint?: string;
   readonly dimensions?: number;
+  readonly supportsDimensions?: boolean;
   readonly maxInputTokens?: number;
+  readonly maxBatchSize?: number;
+  readonly encodingFormat?: "float" | null;
+  readonly cost?: { readonly input: number };
   readonly headers?: Readonly<Record<string, string>>;
 }
 
