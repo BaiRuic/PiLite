@@ -11,7 +11,7 @@ import {
   type RefreshModelsContext,
 } from "@earendil-works/pi-ai";
 import { HarnessError } from "../types.js";
-import { buildApiStreamMap } from "./api-streams.js";
+import { buildApiStreamMap, STANDARD_LAZY_APIS } from "./api-streams.js";
 import { type ConfigValueResolverOptions, resolveConfigHeaders, resolveConfigValue } from "./config-value.js";
 
 export interface BackendAuthResult {
@@ -45,7 +45,11 @@ export interface ApiBackendProviderOptions {
   readonly baseUrl: string;
   /** Default wire protocol for discovered models. Defaults to `"openai-completions"`. */
   readonly defaultApi?: Api;
-  /** Wire protocols this backend can serve. Defaults to `[defaultApi]`. */
+  /**
+   * Wire protocols this backend can serve.
+   * Defaults to all four standard lazy chat APIs (`openai-completions`, `openai-responses`,
+   * `anthropic-messages`, `google-generative-ai`).
+   */
   readonly apis?: readonly Api[];
   /** Custom stream implementations keyed by wire API. */
   readonly apiStreams?: Partial<Record<Api, ProviderStreams>>;
@@ -208,6 +212,12 @@ export function parseOpenAICompatibleModels(payload: unknown, defaults: ParsedMo
       record.samplingParamsByThinkingLevel,
     ) as Model<Api>["samplingParamsByThinkingLevel"];
 
+    const costTiers = Array.isArray(costRecord?.tiers)
+      ? costRecord.tiers
+      : Array.isArray(defaultCost.tiers)
+        ? defaultCost.tiers
+        : undefined;
+
     result.push({
       id,
       name,
@@ -223,6 +233,7 @@ export function parseOpenAICompatibleModels(payload: unknown, defaults: ParsedMo
         output: costRecord?.output ?? defaultCost.output,
         cacheRead: costRecord?.cacheRead ?? defaultCost.cacheRead,
         cacheWrite: costRecord?.cacheWrite ?? defaultCost.cacheWrite,
+        ...(costTiers ? { tiers: structuredClone(costTiers) } : {}),
       },
       ...(headers ? { headers } : {}),
       ...(thinkingLevelMap ? { thinkingLevelMap: structuredClone(thinkingLevelMap) } : {}),
@@ -254,7 +265,7 @@ export function createApiBackendProvider(options: ApiBackendProviderOptions): Pr
   }
 
   const defaultApi: Api = options.defaultApi ?? "openai-completions";
-  const declaredApis = new Set<Api>(options.apis ?? [defaultApi]);
+  const declaredApis = new Set<Api>(options.apis ?? STANDARD_LAZY_APIS);
   declaredApis.add(defaultApi);
   for (const model of options.models ?? []) {
     declaredApis.add(model.api);
@@ -278,7 +289,9 @@ export function createApiBackendProvider(options: ApiBackendProviderOptions): Pr
       const mergedHeaders = mergeCaseInsensitiveHeaders(staticHeaders, resolved.headers);
       return {
         apiKey: resolved.apiKey ?? (options.allowKeyless ? "local" : undefined),
-        baseUrl: resolved.baseUrl ?? options.baseUrl,
+        // Only propagate baseUrl when getAuth() explicitly overrides it;
+        // otherwise pi-ai uses each model's own baseUrl (supporting multi-protocol gateways).
+        ...(resolved.baseUrl !== undefined ? { baseUrl: resolved.baseUrl } : {}),
         ...(Object.keys(mergedHeaders).length > 0 ? { headers: mergedHeaders } : {}),
         source: resolved.source ?? "custom-auth",
       };
@@ -287,7 +300,6 @@ export function createApiBackendProvider(options: ApiBackendProviderOptions): Pr
     if (credential?.key) {
       return {
         apiKey: credential.key,
-        baseUrl: options.baseUrl,
         ...(staticHeaders ? { headers: staticHeaders } : {}),
         source: "stored credential",
       };
@@ -298,7 +310,6 @@ export function createApiBackendProvider(options: ApiBackendProviderOptions): Pr
       if (!resolvedKey) return undefined;
       return {
         apiKey: resolvedKey,
-        baseUrl: options.baseUrl,
         ...(staticHeaders ? { headers: staticHeaders } : {}),
         source: "configured apiKey",
       };
@@ -307,7 +318,6 @@ export function createApiBackendProvider(options: ApiBackendProviderOptions): Pr
     if (options.allowKeyless) {
       return {
         apiKey: "local",
-        baseUrl: options.baseUrl,
         ...(staticHeaders ? { headers: staticHeaders } : {}),
         source: "keyless",
       };

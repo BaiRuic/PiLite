@@ -6,6 +6,17 @@ import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.l
 import { HarnessError } from "../types.js";
 
 /**
+ * Standard chat wire protocols with lazy `pi-ai` stream implementations.
+ * SDK packages (`openai`, `@anthropic-ai/sdk`, `@google/genai`) remain lazy-loaded until first use.
+ */
+export const STANDARD_LAZY_APIS = [
+  "openai-completions",
+  "openai-responses",
+  "anthropic-messages",
+  "google-generative-ai",
+] as const satisfies readonly Api[];
+
+/**
  * Resolve one of the standard chat wire protocols to its lazy `pi-ai` stream implementation.
  * SDK packages (`openai`, `@anthropic-ai/sdk`, `@google/genai`) remain lazy-loaded until first use.
  */

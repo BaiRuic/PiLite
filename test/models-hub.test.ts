@@ -414,12 +414,26 @@ describe("ModelHub: OAuth login, custom JWT backend, local sources, and hot-swap
                 input: ["text", "image"],
                 contextWindow: 128_000,
                 maxTokens: 32_000,
-                cost: { input: 0.55, output: 2.19, cacheRead: 0.14, cacheWrite: 0 },
+                cost: {
+                  input: 0.55,
+                  output: 2.19,
+                  cacheRead: 0.14,
+                  cacheWrite: 0,
+                  tiers: [
+                    {
+                      inputTokensAbove: 200_000,
+                      input: 1.1,
+                      output: 4.38,
+                      cacheRead: 0.28,
+                      cacheWrite: 0,
+                    },
+                  ],
+                },
                 compat: { thinkingFormat: "deepseek", supportsDeveloperRole: true },
                 thinkingLevelMap: { xhigh: "xhigh", minimal: null },
                 headers: { "x-model-tier": "pro", "x-ignored-non-string": 123 },
-                promptCache: { short: { ttlSeconds: 300 } },
-                inputLimits: { images: { maxCount: 10 } },
+                promptCache: { short: 300, long: 3600 },
+                inputLimits: { maxRequestBytes: 20_000_000, images: { maxPerRequest: 10 } },
                 samplingParams: { temperature: 0.3 },
                 samplingParamsByThinkingLevel: { high: { temperature: 0.1 } },
               },
@@ -436,6 +450,15 @@ describe("ModelHub: OAuth login, custom JWT backend, local sources, and hot-swap
     expect(model).toBeDefined();
     expect(model?.baseUrl).toBe("https://gw.example.com/deepseek/v1");
     expect(model?.input).toEqual(["text", "image"]);
+    expect(model?.cost.tiers).toEqual([
+      {
+        inputTokensAbove: 200_000,
+        input: 1.1,
+        output: 4.38,
+        cacheRead: 0.28,
+        cacheWrite: 0,
+      },
+    ]);
     // Per-model compat merges over modelDefaults.compat.
     expect(model?.compat).toEqual({
       supportsStore: false,
@@ -445,9 +468,120 @@ describe("ModelHub: OAuth login, custom JWT backend, local sources, and hot-swap
     expect(model?.headers).toEqual({ "x-model-tier": "pro" });
     expect(model?.thinkingLevelMap).toEqual({ xhigh: "xhigh", minimal: null });
     expect(getSupportedThinkingLevels(model!)).toEqual(["off", "low", "medium", "high", "xhigh"]);
-    expect(model?.promptCache).toEqual({ short: { ttlSeconds: 300 } });
-    expect(model?.inputLimits).toEqual({ images: { maxCount: 10 } });
+    expect(model?.promptCache).toEqual({ short: 300, long: 3600 });
+    expect(model?.inputLimits).toEqual({ maxRequestBytes: 20_000_000, images: { maxPerRequest: 10 } });
     expect(model?.samplingParams).toEqual({ temperature: 0.3 });
     expect(model?.samplingParamsByThinkingLevel).toEqual({ high: { temperature: 0.1 } });
+  });
+
+  it("supports multi-protocol gateways by default without clobbering per-model baseUrl", async () => {
+    const dispatched: Array<{ api: string; baseUrl: string; modelId: string }> = [];
+    const makeSpyStream = (apiName: string) => {
+      const faux = fauxProvider({ provider: "cf-multi", models: [{ id: "dummy" }] });
+      return {
+        stream: (model: any, context: any, options: any) => {
+          dispatched.push({ api: apiName, baseUrl: model.baseUrl, modelId: model.id });
+          faux.setResponses([fauxAssistantMessage(`ok:${apiName}:${model.baseUrl}`)]);
+          return faux.provider.stream(model, context, options);
+        },
+        streamSimple: (model: any, context: any, options: any) => {
+          dispatched.push({ api: apiName, baseUrl: model.baseUrl, modelId: model.id });
+          faux.setResponses([fauxAssistantMessage(`ok:${apiName}:${model.baseUrl}`)]);
+          return faux.provider.streamSimple(model, context, options);
+        },
+      };
+    };
+
+    let overrideBaseUrl: string | undefined;
+    const backend = createApiBackendProvider({
+      id: "cf-multi",
+      baseUrl: "https://gw.example.com/v1",
+      getAuth: async () => ({
+        apiKey: "jwt-token",
+        headers: { "x-gateway-token": "jwt-token" },
+        ...(overrideBaseUrl ? { baseUrl: overrideBaseUrl } : {}),
+      }),
+      // Inject spies via apiStreams without passing `apis` so default 4-API wiring is exercised too.
+      apiStreams: {
+        "anthropic-messages": makeSpyStream("anthropic-messages"),
+        "openai-responses": makeSpyStream("openai-responses"),
+        "google-generative-ai": makeSpyStream("google-generative-ai"),
+      },
+      fetch: async () =>
+        new Response(
+          JSON.stringify({
+            data: [
+              {
+                id: "claude-sonnet-4-5",
+                api: "anthropic-messages",
+                baseUrl: "https://gw.example.com/anthropic",
+              },
+              {
+                id: "gpt-5.4",
+                api: "openai-responses",
+                baseUrl: "https://gw.example.com/openai/v1",
+              },
+              {
+                id: "gemini-2.5-pro",
+                api: "google-generative-ai",
+                baseUrl: "https://gw.example.com/google/v1beta",
+              },
+              {
+                id: "default-openai-model",
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+    });
+
+    const hub = createModelHub({ providers: [backend] });
+    await hub.refresh();
+
+    // Without explicit getAuth().baseUrl, auth.baseUrl is undefined so per-model baseUrl is preserved.
+    const auth = await hub.getAuth("cf-multi");
+    expect(auth?.auth.baseUrl).toBeUndefined();
+    expect(auth?.auth.headers?.["x-gateway-token"]).toBe("jwt-token");
+    expect(hub.getModel("cf-multi", "default-openai-model")?.baseUrl).toBe("https://gw.example.com/v1");
+
+    // Stream through pi-ai Models to confirm each model keeps its own protocol & baseUrl.
+    const claude = hub.getModel("cf-multi", "claude-sonnet-4-5")!;
+    const gpt = hub.getModel("cf-multi", "gpt-5.4")!;
+    const gemini = hub.getModel("cf-multi", "gemini-2.5-pro")!;
+
+    await hub.models
+      .streamSimple(claude, { messages: [{ role: "user", content: "hi", timestamp: 1 }] })
+      .result();
+    await hub.models
+      .streamSimple(gpt, { messages: [{ role: "user", content: "hi", timestamp: 1 }] })
+      .result();
+    await hub.models
+      .streamSimple(gemini, { messages: [{ role: "user", content: "hi", timestamp: 1 }] })
+      .result();
+
+    expect(dispatched).toEqual([
+      {
+        api: "anthropic-messages",
+        baseUrl: "https://gw.example.com/anthropic",
+        modelId: "claude-sonnet-4-5",
+      },
+      { api: "openai-responses", baseUrl: "https://gw.example.com/openai/v1", modelId: "gpt-5.4" },
+      {
+        api: "google-generative-ai",
+        baseUrl: "https://gw.example.com/google/v1beta",
+        modelId: "gemini-2.5-pro",
+      },
+    ]);
+
+    // When getAuth() explicitly returns a baseUrl, it intentionally overrides the request baseUrl.
+    overrideBaseUrl = "https://staging-gw.example.com/override";
+    await hub.models
+      .streamSimple(claude, { messages: [{ role: "user", content: "hi", timestamp: 1 }] })
+      .result();
+    expect(dispatched.at(-1)).toEqual({
+      api: "anthropic-messages",
+      baseUrl: "https://staging-gw.example.com/override",
+      modelId: "claude-sonnet-4-5",
+    });
   });
 });
