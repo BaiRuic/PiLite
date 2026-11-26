@@ -171,9 +171,11 @@ PiLite's default parser `parseOpenAICompatibleModels()` accepts `{ data: [...] }
       },
       "compat": {
         "thinkingFormat": "deepseek",
+        "maxTokensField": "max_tokens",
         "supportsStore": false,
         "supportsDeveloperRole": false,
-        "supportsUsageInStreaming": true
+        "supportsUsageInStreaming": true,
+        "requiresReasoningContentOnAssistantMessages": true
       }
     }
   ]
@@ -199,6 +201,15 @@ PiLite's default parser `parseOpenAICompatibleModels()` accepts `{ data: [...] }
 | `promptCache` | Optional | Prompt cache TTLs in seconds (`{ short?: number; long?: number }`). |
 | `inputLimits` | Optional | Request byte and image preprocessing limits (`{ maxRequestBytes?, images?: { maxPerMessage?, maxPerRequest?, resize? } }`). |
 | `samplingParams` / `samplingParamsByThinkingLevel` | Optional | Default sampling parameters for OpenAI-compatible adapters. |
+
+### Why Explicit `compat` Matters for Passthrough Gateways
+
+When `pi-ai` talks directly to an official endpoint, its `openai-completions` adapter auto-detects vendor quirks from `model.provider` and `model.baseUrl` (for example, matching `deepseek.com`, `api.moonshot.`, or `api.z.ai`). Behind a custom gateway domain (`https://gw.example.com/...`) under your own provider ID, that auto-detection falls back to generic OpenAI defaults.
+
+- **Response parsing stays automatic**: `pi-ai`'s `openai-completions` adapter probes response fields generically (`reasoning_content` / `reasoning` / `reasoning_text` / `reasoning_details`, `chunk.usage` / `choices[0].usage`, etc.), so streamed responses still parse accurately through a passthrough proxy.
+- **Request parameters rely on `compat` (and `thinkingLevelMap`)**: Include explicit `compat` on non-OpenAI `openai-completions` models (DeepSeek, Z.ai/GLM, Moonshot/Kimi, Qwen, etc.) directly inside each model entry returned by `GET /v1/models`.
+- **Anthropic (`anthropic-messages`), OpenAI (`openai-responses`), and Google (`google-generative-ai`)** models do **not** need `compat` — setting `api`, `baseUrl`, and the standard capability fields is sufficient.
+- **Keep authoring simple**: Always serve self-contained model JSON from `GET /v1/models` so older clients work immediately when you add new models on the gateway. For a small catalog (e.g. <= 10 models), inline `compat` and `thinkingLevelMap` directly in your gateway's model definitions (you can copy exact values from `node_modules/@earendil-works/pi-ai/dist/providers/data/*.json`). If your catalog grows large, a TypeScript Worker can import individual data modules such as `@earendil-works/pi-ai/providers/deepseek.models` at build time (Wrangler tree-shakes away all SDK runtimes) and expand them into full JSON responses.
 
 ---
 
@@ -478,9 +489,11 @@ const CATALOG: readonly GatewayModelEntry[] = [
     cost: { input: 0.55, output: 2.19, cacheRead: 0.14, cacheWrite: 0 },
     compat: {
       thinkingFormat: "deepseek",
+      maxTokensField: "max_tokens",
       supportsStore: false,
       supportsDeveloperRole: false,
       supportsUsageInStreaming: true,
+      requiresReasoningContentOnAssistantMessages: true,
     },
   },
 ];
@@ -853,25 +866,32 @@ function extractUsageFromPayload(
   anthropicState: { input: number; output: number; cacheRead: number; cacheWrite: number; seen: boolean },
 ): NormalizedUsage | undefined {
   if (api === "openai-completions") {
-    const u = asRecord(payload.usage);
+    // Some OpenAI-compatible providers (e.g. Moonshot) place usage on choices[0].usage.
+    const firstChoice = Array.isArray(payload.choices) ? asRecord(payload.choices[0]) : undefined;
+    const u = asRecord(payload.usage ?? firstChoice?.usage);
     if (!u) return undefined;
     const promptTokens = num(u.prompt_tokens);
     const completionTokens = num(u.completion_tokens);
     const promptDetails = asRecord(u.prompt_tokens_details);
     const completionDetails = asRecord(u.completion_tokens_details);
-    const cacheRead = num(promptDetails?.cached_tokens ?? u.prompt_cache_hit_tokens);
-    const reasoning =
-      completionDetails?.reasoning_tokens !== undefined ? num(completionDetails.reasoning_tokens) : undefined;
-    // OpenAI prompt_tokens INCLUDES cached tokens -> subtract cacheRead to avoid double-billing.
-    const input = Math.max(0, promptTokens - cacheRead);
+    // Match pi-ai fallbacks across OpenAI/OpenRouter (prompt_tokens_details.cached_tokens),
+    // DeepSeek (prompt_cache_hit_tokens), and Kimi/Moonshot (top-level cached_tokens).
+    const cacheRead = num(
+      promptDetails?.cached_tokens ?? u.prompt_cache_hit_tokens ?? u.cached_tokens,
+    );
+    const cacheWrite = num(promptDetails?.cache_write_tokens);
+    const rawReasoning = completionDetails?.reasoning_tokens ?? u.reasoning_tokens;
+    const reasoning = rawReasoning !== undefined ? num(rawReasoning) : undefined;
+    // OpenAI-compatible prompt_tokens INCLUDES cached tokens -> subtract cacheRead and cacheWrite.
+    const input = Math.max(0, promptTokens - cacheRead - cacheWrite);
     const output = completionTokens;
     return {
       input,
       output,
       cacheRead,
-      cacheWrite: 0,
+      cacheWrite,
       ...(reasoning !== undefined ? { reasoning } : {}),
-      totalTokens: num(u.total_tokens) || input + output + cacheRead,
+      totalTokens: num(u.total_tokens) || input + output + cacheRead + cacheWrite,
     };
   }
 
@@ -1073,8 +1093,9 @@ function jsonError(status: number, message: string, extraHeaders: Record<string,
 
 When computing billed cost on the server, pay close attention to three provider differences (already handled in `extractUsageFromPayload` above):
 
-1. **Cached input token sign convention**:
-   - **OpenAI (`openai-completions` & `openai-responses`) and Google (`google-generative-ai`)**: `prompt_tokens` / `input_tokens` / `promptTokenCount` **include** cached tokens. Subtract `cacheRead` before multiplying by the full input rate, otherwise you double-bill cached reads.
+1. **Cached input token sign convention & `openai-completions` vendor fallbacks**:
+   - **OpenAI (`openai-completions` & `openai-responses`) and Google (`google-generative-ai`)**: `prompt_tokens` / `input_tokens` / `promptTokenCount` **include** cached tokens. Subtract `cacheRead` (and `cacheWrite` when reported by OpenAI-compatible proxies) before multiplying by the full input rate, otherwise you double-bill cached reads.
+   - **`openai-completions` vendor field variations**: Aligned with `pi-ai`, check both `chunk.usage` and `choices[0].usage` (Moonshot), check `prompt_tokens_details.cached_tokens ?? prompt_cache_hit_tokens ?? cached_tokens` (OpenAI / DeepSeek / Kimi), check `prompt_tokens_details.cache_write_tokens` (OpenRouter), and check `completion_tokens_details.reasoning_tokens ?? reasoning_tokens`.
    - **Anthropic (`anthropic-messages`)**: `input_tokens` is **non-cached input only**. Do **not** subtract `cache_read_input_tokens` or `cache_creation_input_tokens`.
 2. **Anthropic split SSE events**:
    - `message_start` carries `message.usage` (`input_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`).
